@@ -44,18 +44,18 @@ Box* BoxedCode::filename(Box* b, void*) {
 Box* BoxedCode::firstlineno(Box* b, void*) {
     RELEASE_ASSERT(b->cls == code_cls, "");
     BoxedCode* code = static_cast<BoxedCode*>(b);
-    CLFunction* cl = code->f;
+    FunctionMetadata* md = code->f;
 
-    if (!cl->source) {
+    if (!md->source) {
         // I don't think it really matters what we return here;
         // in CPython, builtin functions don't have code objects.
         return boxInt(-1);
     }
 
-    if (cl->source->ast->lineno == (uint32_t)-1)
+    if (md->source->ast->lineno == (uint32_t)-1)
         return boxInt(-1);
 
-    return boxInt(cl->source->ast->lineno);
+    return boxInt(md->source->ast->lineno);
 }
 
 Box* BoxedCode::argcount(Box* b, void*) {
@@ -97,10 +97,10 @@ Box* BoxedCode::flags(Box* b, void*) {
 }
 
 Box* codeForFunction(BoxedFunction* f) {
-    return f->f->getCode();
+    return f->md->getCode();
 }
 
-CLFunction* clfunctionFromCode(Box* code) {
+FunctionMetadata* metadataFromCode(Box* code) {
     assert(code->cls == code_cls);
     return static_cast<BoxedCode*>(code)->f;
 }
@@ -120,13 +120,12 @@ void setupCode() {
 
     code_cls->giveAttr("__new__", None); // Hacky way of preventing users from instantiating this
 
-    code_cls->giveAttr("co_name", new (pyston_getset_cls) BoxedGetsetDescriptor(BoxedCode::name, NULL, NULL));
-    code_cls->giveAttr("co_filename", new (pyston_getset_cls) BoxedGetsetDescriptor(BoxedCode::filename, NULL, NULL));
-    code_cls->giveAttr("co_firstlineno",
-                       new (pyston_getset_cls) BoxedGetsetDescriptor(BoxedCode::firstlineno, NULL, NULL));
-    code_cls->giveAttr("co_argcount", new (pyston_getset_cls) BoxedGetsetDescriptor(BoxedCode::argcount, NULL, NULL));
-    code_cls->giveAttr("co_varnames", new (pyston_getset_cls) BoxedGetsetDescriptor(BoxedCode::varnames, NULL, NULL));
-    code_cls->giveAttr("co_flags", new (pyston_getset_cls) BoxedGetsetDescriptor(BoxedCode::flags, NULL, NULL));
+    code_cls->giveAttrDescriptor("co_name", BoxedCode::name, NULL);
+    code_cls->giveAttrDescriptor("co_filename", BoxedCode::filename, NULL);
+    code_cls->giveAttrDescriptor("co_firstlineno", BoxedCode::firstlineno, NULL);
+    code_cls->giveAttrDescriptor("co_argcount", BoxedCode::argcount, NULL);
+    code_cls->giveAttrDescriptor("co_varnames", BoxedCode::varnames, NULL);
+    code_cls->giveAttrDescriptor("co_flags", BoxedCode::flags, NULL);
 
     code_cls->freeze();
 }

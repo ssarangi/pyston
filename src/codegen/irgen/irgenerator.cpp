@@ -20,6 +20,7 @@
 #include "analysis/function_analysis.h"
 #include "analysis/scoping_analysis.h"
 #include "analysis/type_analysis.h"
+#include "asm_writing/icinfo.h"
 #include "codegen/codegen.h"
 #include "codegen/compvars.h"
 #include "codegen/irgen.h"
@@ -43,10 +44,10 @@ extern "C" void dumpLLVM(void* _v) {
     v->dump();
 }
 
-IRGenState::IRGenState(CLFunction* clfunc, CompiledFunction* cf, SourceInfo* source_info,
+IRGenState::IRGenState(FunctionMetadata* md, CompiledFunction* cf, SourceInfo* source_info,
                        std::unique_ptr<PhiAnalysis> phis, ParamNames* param_names, GCBuilder* gc,
                        llvm::MDNode* func_dbg_info)
-    : clfunc(clfunc),
+    : md(md),
       cf(cf),
       source_info(source_info),
       phis(std::move(phis)),
@@ -55,11 +56,12 @@ IRGenState::IRGenState(CLFunction* clfunc, CompiledFunction* cf, SourceInfo* sou
       func_dbg_info(func_dbg_info),
       scratch_space(NULL),
       frame_info(NULL),
-      frame_info_arg(NULL),
       globals(NULL),
+      vregs(NULL),
+      stmt(NULL),
       scratch_size(0) {
     assert(cf->func);
-    assert(!cf->clfunc); // in this case don't need to pass in sourceinfo
+    assert(!cf->md); // in this case don't need to pass in sourceinfo
 }
 
 IRGenState::~IRGenState() {
@@ -142,7 +144,7 @@ static llvm::Value* getExcinfoGep(llvm::IRBuilder<true>& builder, llvm::Value* v
     return builder.CreateConstInBoundsGEP2_32(v, 0, 0);
 }
 
-static llvm::Value* getFrameObjGep(llvm::IRBuilder<true>& builder, llvm::Value* v) {
+template <typename Builder> static llvm::Value* getFrameObjGep(Builder& builder, llvm::Value* v) {
     static_assert(offsetof(FrameInfo, exc) == 0, "");
     static_assert(sizeof(ExcInfo) == 24, "");
     static_assert(sizeof(Box*) == 8, "");
@@ -152,7 +154,28 @@ static llvm::Value* getFrameObjGep(llvm::IRBuilder<true>& builder, llvm::Value* 
     // gep->accumulateConstantOffset(g.tm->getDataLayout(), ap_offset)
 }
 
-llvm::Value* IRGenState::getFrameInfoVar() {
+template <typename Builder> static llvm::Value* getPassedClosureGep(Builder& builder, llvm::Value* v) {
+    static_assert(offsetof(FrameInfo, passed_closure) == 40, "");
+    return builder.CreateConstInBoundsGEP2_32(v, 0, 3);
+}
+
+template <typename Builder> static llvm::Value* getVRegsGep(Builder& builder, llvm::Value* v) {
+    static_assert(offsetof(FrameInfo, vregs) == 48, "");
+    return builder.CreateConstInBoundsGEP2_32(v, 0, 4);
+}
+
+template <typename Builder> static llvm::Value* getStmtGep(Builder& builder, llvm::Value* v) {
+    static_assert(offsetof(FrameInfo, stmt) == 56, "");
+    return builder.CreateConstInBoundsGEP2_32(v, 0, 5);
+}
+
+template <typename Builder> static llvm::Value* getGlobalsGep(Builder& builder, llvm::Value* v) {
+    static_assert(offsetof(FrameInfo, globals) == 64, "");
+    return builder.CreateConstInBoundsGEP2_32(v, 0, 6);
+}
+
+void IRGenState::setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* passed_globals,
+                                   llvm::Value* frame_info_arg) {
     /*
         There is a matrix of possibilities here.
 
@@ -170,70 +193,123 @@ llvm::Value* IRGenState::getFrameInfoVar() {
         - If the function is NAME-scope, we extract the boxedLocals from the frame_info in order
           to set this->boxed_locals.
     */
+    assert(!frame_info);
+    llvm::BasicBlock& entry_block = getLLVMFunction()->getEntryBlock();
 
-    if (!this->frame_info) {
-        llvm::BasicBlock& entry_block = getLLVMFunction()->getEntryBlock();
+    llvm::IRBuilder<true> builder(&entry_block);
 
-        llvm::IRBuilder<true> builder(&entry_block);
+    if (entry_block.begin() != entry_block.end())
+        builder.SetInsertPoint(&entry_block, entry_block.getFirstInsertionPt());
 
-        if (entry_block.begin() != entry_block.end())
-            builder.SetInsertPoint(&entry_block, entry_block.getFirstInsertionPt());
+    if (entry_block.getTerminator())
+        builder.SetInsertPoint(entry_block.getTerminator());
+    else
+        builder.SetInsertPoint(&entry_block);
 
+    llvm::AllocaInst* al_pointer_to_frame_info
+        = builder.CreateAlloca(g.llvm_frame_info_type->getPointerTo(), NULL, "frame_info_ptr");
+
+    if (frame_info_arg) {
+        assert(!passed_closure);
+        assert(!passed_globals);
+
+        // The OSR case
+
+        this->frame_info = frame_info_arg;
+
+        // use vrags array from the interpreter
+        vregs = builder.CreateLoad(getVRegsGep(builder, frame_info_arg));
+        this->globals = builder.CreateLoad(getGlobalsGep(builder, frame_info_arg));
+
+        if (getScopeInfo()->usesNameLookup()) {
+            // load frame_info.boxedLocals
+            this->boxed_locals = builder.CreateLoad(getBoxedLocalsGep(builder, this->frame_info));
+        }
+
+    } else {
+        // The "normal" case
+        assert(!vregs);
+        getMD()->calculateNumVRegs();
+        int num_user_visible_vregs = getMD()->source->cfg->sym_vreg_map_user_visible.size();
+        if (num_user_visible_vregs > 0) {
+            auto* vregs_alloca
+                = builder.CreateAlloca(g.llvm_value_type_ptr, getConstantInt(num_user_visible_vregs), "vregs");
+            // Clear the vregs array because 0 means undefined valued.
+            builder.CreateMemSet(vregs_alloca, getConstantInt(0, g.i8),
+                                 getConstantInt(num_user_visible_vregs * sizeof(Box*)), vregs_alloca->getAlignment());
+            vregs = vregs_alloca;
+        } else
+            vregs = getNullPtr(g.llvm_value_type_ptr_ptr);
 
         llvm::AllocaInst* al = builder.CreateAlloca(g.llvm_frame_info_type, NULL, "frame_info");
         assert(al->isStaticAlloca());
 
-        if (entry_block.getTerminator())
-            builder.SetInsertPoint(entry_block.getTerminator());
-        else
-            builder.SetInsertPoint(&entry_block);
 
-        if (frame_info_arg) {
-            // The OSR case
+        // frame_info.exc.type = NULL
+        llvm::Constant* null_value = getNullPtr(g.llvm_value_type_ptr);
+        llvm::Value* exc_info = getExcinfoGep(builder, al);
+        builder.CreateStore(null_value,
+                            builder.CreateConstInBoundsGEP2_32(exc_info, 0, offsetof(ExcInfo, type) / sizeof(Box*)));
 
-            this->frame_info = frame_info_arg;
+        // frame_info.boxedLocals = NULL
+        llvm::Value* boxed_locals_gep = getBoxedLocalsGep(builder, al);
+        builder.CreateStore(getNullPtr(g.llvm_value_type_ptr), boxed_locals_gep);
 
-            if (getScopeInfo()->usesNameLookup()) {
-                // load frame_info.boxedLocals
-                this->boxed_locals = builder.CreateLoad(getBoxedLocalsGep(builder, this->frame_info));
-            }
-        } else {
-            // The "normal" case
-
-            // frame_info.exc.type = NULL
-            llvm::Constant* null_value = getNullPtr(g.llvm_value_type_ptr);
-            llvm::Value* exc_info = getExcinfoGep(builder, al);
-            builder.CreateStore(
-                null_value, builder.CreateConstInBoundsGEP2_32(exc_info, 0, offsetof(ExcInfo, type) / sizeof(Box*)));
-
-            // frame_info.boxedLocals = NULL
-            llvm::Value* boxed_locals_gep = getBoxedLocalsGep(builder, al);
-            builder.CreateStore(getNullPtr(g.llvm_value_type_ptr), boxed_locals_gep);
-
-            if (getScopeInfo()->usesNameLookup()) {
-                // frame_info.boxedLocals = createDict()
-                // (Since this can call into the GC, we have to initialize it to NULL first as we did above.)
-                this->boxed_locals = builder.CreateCall(g.funcs.createDict);
-                builder.CreateStore(this->boxed_locals, boxed_locals_gep);
-            }
-
-            // frame_info.frame_obj = NULL
-            static llvm::Type* llvm_frame_obj_type_ptr
-                = llvm::cast<llvm::StructType>(g.llvm_frame_info_type)->getElementType(2);
-            builder.CreateStore(getNullPtr(llvm_frame_obj_type_ptr), getFrameObjGep(builder, al));
-
-            this->frame_info = al;
+        if (getScopeInfo()->usesNameLookup()) {
+            // frame_info.boxedLocals = createDict()
+            // (Since this can call into the GC, we have to initialize it to NULL first as we did above.)
+            this->boxed_locals = builder.CreateCall(g.funcs.createDict);
+            builder.CreateStore(this->boxed_locals, boxed_locals_gep);
         }
+
+        // frame_info.frame_obj = NULL
+        static llvm::Type* llvm_frame_obj_type_ptr
+            = llvm::cast<llvm::StructType>(g.llvm_frame_info_type)->getElementType(2);
+        builder.CreateStore(getNullPtr(llvm_frame_obj_type_ptr), getFrameObjGep(builder, al));
+
+        // set  frame_info.passed_closure
+        builder.CreateStore(passed_closure, getPassedClosureGep(builder, al));
+        // set frame_info.globals
+        builder.CreateStore(passed_globals, getGlobalsGep(builder, al));
+        // set frame_info.vregs
+        builder.CreateStore(vregs, getVRegsGep(builder, al));
+
+        this->frame_info = al;
+        this->globals = passed_globals;
     }
 
-    return this->frame_info;
+    stmt = getStmtGep(builder, frame_info);
+    builder.CreateStore(this->frame_info, al_pointer_to_frame_info);
+    // Create stackmap to make a pointer to the frame_info location known
+    PatchpointInfo* info = PatchpointInfo::create(getCurFunction(), 0, 0, 0);
+    std::vector<llvm::Value*> args;
+    args.push_back(getConstantInt(info->getId(), g.i64));
+    args.push_back(getConstantInt(0, g.i32));
+    args.push_back(al_pointer_to_frame_info);
+    info->setNumFrameArgs(1);
+    info->setIsFrameInfoStackmap();
+    builder.CreateCall(llvm::Intrinsic::getDeclaration(g.cur_module, llvm::Intrinsic::experimental_stackmap), args);
+}
+
+llvm::Value* IRGenState::getFrameInfoVar() {
+    assert(frame_info);
+    return frame_info;
 }
 
 llvm::Value* IRGenState::getBoxedLocalsVar() {
     assert(getScopeInfo()->usesNameLookup());
-    getFrameInfoVar(); // ensures this->boxed_locals_var is initialized
     assert(this->boxed_locals != NULL);
     return this->boxed_locals;
+}
+
+llvm::Value* IRGenState::getVRegsVar() {
+    assert(vregs);
+    return vregs;
+}
+
+llvm::Value* IRGenState::getStmtVar() {
+    assert(stmt);
+    return stmt;
 }
 
 ScopeInfo* IRGenState::getScopeInfo() {
@@ -245,18 +321,9 @@ ScopeInfo* IRGenState::getScopeInfoForNode(AST* node) {
     return source->scoping->getScopeInfoForNode(node);
 }
 
-void IRGenState::setGlobals(llvm::Value* globals) {
-    assert(!source_info->scoping->areGlobalsFromModule());
-    assert(!this->globals);
-    this->globals = globals;
-}
-
 llvm::Value* IRGenState::getGlobals() {
-    if (!globals) {
-        assert(source_info->scoping->areGlobalsFromModule());
-        this->globals = embedRelocatablePtr(source_info->parent_module, g.llvm_value_type_ptr);
-    }
-    return this->globals;
+    assert(globals);
+    return globals;
 }
 
 llvm::Value* IRGenState::getGlobalsIfCustom() {
@@ -421,27 +488,10 @@ public:
         }
 #endif
 
-        if (ENABLE_FRAME_INTROSPECTION) {
-            llvm::Type* rtn_type = llvm::cast<llvm::FunctionType>(llvm::cast<llvm::PointerType>(callee->getType())
-                                                                      ->getElementType())->getReturnType();
-
-            llvm::Value* bitcasted = getBuilder()->CreateBitCast(callee, g.i8->getPointerTo());
-            llvm::CallSite cs = emitPatchpoint(rtn_type, NULL, bitcasted, args, {}, unw_info, target_exception_style);
-
-            if (rtn_type == cs->getType()) {
-                return cs.getInstruction();
-            } else if (rtn_type == g.i1) {
-                return getBuilder()->CreateTrunc(cs.getInstruction(), rtn_type);
-            } else if (llvm::isa<llvm::PointerType>(rtn_type)) {
-                return getBuilder()->CreateIntToPtr(cs.getInstruction(), rtn_type);
-            } else {
-                cs.getInstruction()->getType()->dump();
-                rtn_type->dump();
-                RELEASE_ASSERT(0, "don't know how to convert those");
-            }
-        } else {
-            return emitCall(unw_info, callee, args, target_exception_style).getInstruction();
-        }
+        llvm::Value* stmt = unw_info.current_stmt ? embedRelocatablePtr(unw_info.current_stmt, g.llvm_aststmt_type_ptr)
+                                                  : getNullPtr(g.llvm_aststmt_type_ptr);
+        getBuilder()->CreateStore(stmt, irstate->getStmtVar());
+        return emitCall(unw_info, callee, args, target_exception_style).getInstruction();
     }
 
     llvm::Value* createCall(const UnwindInfo& unw_info, llvm::Value* callee,
@@ -474,6 +524,14 @@ public:
 
         rtn.setCallingConv(pp->getCallingConvention());
         return rtn.getInstruction();
+    }
+
+    llvm::Value* createDeopt(AST_stmt* current_stmt, AST_expr* node, llvm::Value* node_value) override {
+        ICSetupInfo* pp = createDeoptIC();
+        llvm::Value* v
+            = createIC(pp, (void*)pyston::deopt, { embedRelocatablePtr(node, g.llvm_astexpr_type_ptr), node_value },
+                       UnwindInfo(current_stmt, NULL));
+        return getBuilder()->CreateIntToPtr(v, g.llvm_value_type_ptr);
     }
 
     void checkAndPropagateCapiException(const UnwindInfo& unw_info, llvm::Value* returned_val, llvm::Value* exc_val,
@@ -526,7 +584,6 @@ const std::string CREATED_CLOSURE_NAME = "#created_closure";
 const std::string PASSED_CLOSURE_NAME = "#passed_closure";
 const std::string PASSED_GENERATOR_NAME = "#passed_generator";
 const std::string FRAME_INFO_PTR_NAME = "#frame_info_ptr";
-const std::string PASSED_GLOBALS_NAME = "#passed_globals";
 
 bool isIsDefinedName(llvm::StringRef name) {
     return startswith(name, "!is_defined_");
@@ -596,10 +653,12 @@ private:
             type_recorder = NULL;
         }
 
-        return OpInfo(irstate->getEffortLevel(), type_recorder, unw_info);
+        return OpInfo(irstate->getEffortLevel(), type_recorder, unw_info, ICInfo::getICInfoForNode(ast));
     }
 
-    OpInfo getEmptyOpInfo(const UnwindInfo& unw_info) { return OpInfo(irstate->getEffortLevel(), NULL, unw_info); }
+    OpInfo getEmptyOpInfo(const UnwindInfo& unw_info) {
+        return OpInfo(irstate->getEffortLevel(), NULL, unw_info, NULL);
+    }
 
     void createExprTypeGuard(llvm::Value* check_val, AST* node, llvm::Value* node_value, AST_stmt* current_statement) {
         assert(check_val->getType() == g.i1);
@@ -622,8 +681,7 @@ private:
 
         curblock = deopt_bb;
         emitter.getBuilder()->SetInsertPoint(curblock);
-        llvm::Value* v = emitter.createCall2(UnwindInfo(current_statement, NULL), g.funcs.deopt,
-                                             embedRelocatablePtr(node, g.llvm_astexpr_type_ptr), node_value);
+        llvm::Value* v = emitter.createDeopt(current_statement, (AST_expr*)node, node_value);
         emitter.getBuilder()->CreateRet(v);
 
         curblock = success_bb;
@@ -799,7 +857,7 @@ private:
                 assert(node->args.size() == 1);
                 CompilerVariable* obj = evalExpr(node->args[0], unw_info);
 
-                ConcreteCompilerVariable* rtn = obj->nonzero(emitter, getOpInfoForNode(node, unw_info));
+                CompilerVariable* rtn = obj->nonzero(emitter, getOpInfoForNode(node, unw_info));
                 obj->decvref(emitter);
                 return rtn;
             }
@@ -807,7 +865,7 @@ private:
                 assert(node->args.size() == 1);
                 CompilerVariable* obj = evalExpr(node->args[0], unw_info);
 
-                ConcreteCompilerVariable* rtn = obj->hasnext(emitter, getOpInfoForNode(node, unw_info));
+                CompilerVariable* rtn = obj->hasnext(emitter, getOpInfoForNode(node, unw_info));
                 obj->decvref(emitter);
                 return rtn;
             }
@@ -1078,15 +1136,6 @@ private:
         auto ellipsis_cls = Ellipsis->cls;
         return new ConcreteCompilerVariable(typeFromClass(ellipsis_cls), ellipsis, false);
     }
-    ConcreteCompilerVariable* getNone() {
-        llvm::Constant* none = embedRelocatablePtr(None, g.llvm_value_type_ptr, "cNone");
-        return new ConcreteCompilerVariable(typeFromClass(none_cls), none, false);
-    }
-
-    llvm::Constant* embedParentModulePtr() {
-        BoxedModule* parent_module = irstate->getSourceInfo()->parent_module;
-        return embedRelocatablePtr(parent_module, g.llvm_value_type_ptr, "cParentModule");
-    }
 
     ConcreteCompilerVariable* _getGlobal(AST_Name* node, const UnwindInfo& unw_info) {
         if (node->id.s() == "None")
@@ -1264,28 +1313,11 @@ private:
 
     CompilerVariable* evalSlice(AST_Slice* node, const UnwindInfo& unw_info) {
         CompilerVariable* start, *stop, *step;
-        start = node->lower ? evalExpr(node->lower, unw_info) : getNone();
-        stop = node->upper ? evalExpr(node->upper, unw_info) : getNone();
-        step = node->step ? evalExpr(node->step, unw_info) : getNone();
+        start = node->lower ? evalExpr(node->lower, unw_info) : NULL;
+        stop = node->upper ? evalExpr(node->upper, unw_info) : NULL;
+        step = node->step ? evalExpr(node->step, unw_info) : NULL;
 
-        ConcreteCompilerVariable* cstart, *cstop, *cstep;
-        cstart = start->makeConverted(emitter, start->getBoxType());
-        cstop = stop->makeConverted(emitter, stop->getBoxType());
-        cstep = step->makeConverted(emitter, step->getBoxType());
-        start->decvref(emitter);
-        stop->decvref(emitter);
-        step->decvref(emitter);
-
-        std::vector<llvm::Value*> args;
-        args.push_back(cstart->getValue());
-        args.push_back(cstop->getValue());
-        args.push_back(cstep->getValue());
-        llvm::Value* rtn = emitter.getBuilder()->CreateCall(g.funcs.createSlice, args);
-
-        cstart->decvref(emitter);
-        cstop->decvref(emitter);
-        cstep->decvref(emitter);
-        return new ConcreteCompilerVariable(SLICE, rtn, true);
+        return makeSlice(start, stop, step);
     }
 
     CompilerVariable* evalExtSlice(AST_ExtSlice* node, const UnwindInfo& unw_info) {
@@ -1348,18 +1380,18 @@ private:
         CompilerVariable* operand = evalExpr(node->operand, unw_info);
 
         if (node->op_type == AST_TYPE::Not) {
-            ConcreteCompilerVariable* rtn = operand->nonzero(emitter, getOpInfoForNode(node, unw_info));
+            CompilerVariable* rtn = operand->nonzero(emitter, getOpInfoForNode(node, unw_info));
             operand->decvref(emitter);
 
             assert(rtn->getType() == BOOL);
-            llvm::Value* v = i1FromBool(emitter, rtn);
+            llvm::Value* v = i1FromBool(emitter, static_cast<ConcreteCompilerVariable*>(rtn));
             assert(v->getType() == g.i1);
 
             llvm::Value* negated = emitter.getBuilder()->CreateNot(v);
             rtn->decvref(emitter);
             return boolFromI1(emitter, negated);
         } else {
-            ConcreteCompilerVariable* rtn = operand->unaryop(emitter, getOpInfoForNode(node, unw_info), node->op_type);
+            CompilerVariable* rtn = operand->unaryop(emitter, getOpInfoForNode(node, unw_info), node->op_type);
             operand->decvref(emitter);
             return rtn;
         }
@@ -1408,7 +1440,7 @@ private:
             decorators.push_back(evalExpr(d, unw_info));
         }
 
-        CLFunction* cl = wrapFunction(node, nullptr, node->body, irstate->getSourceInfo());
+        FunctionMetadata* md = wrapFunction(node, nullptr, node->body, irstate->getSourceInfo());
 
         // TODO duplication with _createFunction:
         CompilerVariable* created_closure = NULL;
@@ -1427,7 +1459,7 @@ private:
         // but since the classdef can't create its own closure, shouldn't need to explicitly
         // create that scope to pass the closure through.
         assert(irstate->getSourceInfo()->scoping->areGlobalsFromModule());
-        CompilerVariable* func = makeFunction(emitter, cl, created_closure, irstate->getGlobalsIfCustom(), {});
+        CompilerVariable* func = makeFunction(emitter, md, created_closure, irstate->getGlobalsIfCustom(), {});
 
         CompilerVariable* attr_dict = func->call(emitter, getEmptyOpInfo(unw_info), ArgPassSpec(0), {}, NULL);
 
@@ -1454,7 +1486,7 @@ private:
 
     CompilerVariable* _createFunction(AST* node, const UnwindInfo& unw_info, AST_arguments* args,
                                       const std::vector<AST_stmt*>& body) {
-        CLFunction* cl = wrapFunction(node, args, body, irstate->getSourceInfo());
+        FunctionMetadata* md = wrapFunction(node, args, body, irstate->getSourceInfo());
 
         std::vector<ConcreteCompilerVariable*> defaults;
         for (auto d : args->defaults) {
@@ -1478,7 +1510,7 @@ private:
             takes_closure = irstate->getScopeInfoForNode(node)->takesClosure();
         }
 
-        bool is_generator = cl->source->is_generator;
+        bool is_generator = md->source->is_generator;
 
         if (takes_closure) {
             if (irstate->getScopeInfo()->createsClosure()) {
@@ -1490,7 +1522,7 @@ private:
             assert(created_closure);
         }
 
-        CompilerVariable* func = makeFunction(emitter, cl, created_closure, irstate->getGlobalsIfCustom(), defaults);
+        CompilerVariable* func = makeFunction(emitter, md, created_closure, irstate->getGlobalsIfCustom(), defaults);
 
         for (auto d : defaults) {
             d->decvref(emitter);
@@ -1517,19 +1549,13 @@ private:
     }
 
     // Note: the behavior of this function must match type_analysis.cpp:unboxedType()
-    ConcreteCompilerVariable* unboxVar(ConcreteCompilerType* t, llvm::Value* v, bool grabbed) {
-#if ENABLE_UNBOXED_VALUES
+    CompilerVariable* unboxVar(ConcreteCompilerType* t, llvm::Value* v, bool grabbed) {
         if (t == BOXED_INT) {
-            llvm::Value* unboxed = emitter.getBuilder()->CreateCall(g.funcs.unboxInt, v);
-            ConcreteCompilerVariable* rtn = new ConcreteCompilerVariable(INT, unboxed, true);
-            return rtn;
+            return makeUnboxedInt(emitter, v);
         }
         if (t == BOXED_FLOAT) {
-            llvm::Value* unboxed = emitter.getBuilder()->CreateCall(g.funcs.unboxFloat, v);
-            ConcreteCompilerVariable* rtn = new ConcreteCompilerVariable(FLOAT, unboxed, true);
-            return rtn;
+            return makeUnboxedFloat(emitter, v);
         }
-#endif
         if (t == BOXED_BOOL) {
             llvm::Value* unboxed = emitter.getBuilder()->CreateCall(g.funcs.unboxBool, v);
             return boolFromI1(emitter, unboxed);
@@ -1548,7 +1574,7 @@ private:
 
             ConcreteCompilerType* speculated_type = typeFromClass(speculated_class);
             if (VERBOSITY("irgen") >= 2) {
-                printf("Speculating that %s is actually %s, at ", rtn->getConcreteType()->debugName().c_str(),
+                printf("Speculating that %s is actually %s, at ", rtn->getType()->debugName().c_str(),
                        speculated_type->debugName().c_str());
                 fflush(stdout);
                 print_ast(node);
@@ -1580,6 +1606,7 @@ private:
         }
 
         assert(rtn);
+        assert(rtn->getType()->isUsable());
 
         return rtn;
     }
@@ -1724,10 +1751,27 @@ private:
         return rtn;
     }
 
+    template <typename GetLLVMValCB> void _setVRegIfUserVisible(InternedString name, GetLLVMValCB get_llvm_val_cb) {
+        auto cfg = irstate->getSourceInfo()->cfg;
+        if (!cfg->hasVregsAssigned())
+            irstate->getMD()->calculateNumVRegs();
+        assert(cfg->sym_vreg_map.count(name));
+        int vreg = cfg->sym_vreg_map[name];
+        assert(vreg >= 0);
+
+        if (vreg < cfg->sym_vreg_map_user_visible.size()) {
+            // looks like this store don't have to be volatile because llvm knows that the vregs are visible thru the
+            // FrameInfo which escapes.
+            auto* gep = emitter.getBuilder()->CreateConstInBoundsGEP1_64(irstate->getVRegsVar(), vreg);
+            emitter.getBuilder()->CreateStore(get_llvm_val_cb(), gep);
+        }
+    }
+
     // only updates symbol_table if we're *not* setting a global
     void _doSet(InternedString name, CompilerVariable* val, const UnwindInfo& unw_info) {
         assert(name.s() != "None");
         assert(name.s() != FRAME_INFO_PTR_NAME);
+        assert(val->getType()->isUsable());
 
         auto scope_info = irstate->getScopeInfo();
         ScopeInfo::VarScopeType vst = scope_info->getScopeTypeOfName(name);
@@ -1735,7 +1779,7 @@ private:
 
         if (vst == ScopeInfo::VarScopeType::GLOBAL) {
             if (irstate->getSourceInfo()->scoping->areGlobalsFromModule()) {
-                auto parent_module = llvm::ConstantExpr::getPointerCast(embedParentModulePtr(), g.llvm_value_type_ptr);
+                auto parent_module = irstate->getGlobals();
                 ConcreteCompilerVariable* module = new ConcreteCompilerVariable(MODULE, parent_module, false);
                 module->setattr(emitter, getEmptyOpInfo(unw_info), name.getBox(), val);
                 module->decvref(emitter);
@@ -1777,6 +1821,9 @@ private:
                 llvm::Value* gep = getClosureElementGep(emitter, closureValue, offset);
                 emitter.getBuilder()->CreateStore(val->makeConverted(emitter, UNKNOWN)->getValue(), gep);
             }
+
+            auto&& get_llvm_val = [&]() { return val->makeConverted(emitter, UNKNOWN)->getValue(); };
+            _setVRegIfUserVisible(name, get_llvm_val);
         }
     }
 
@@ -1969,6 +2016,8 @@ private:
         // SyntaxError: can not delete variable 'x' referenced in nested scope
         assert(vst == ScopeInfo::VarScopeType::FAST);
 
+        _setVRegIfUserVisible(target->id, []() { return getNullPtr(g.llvm_value_type_ptr); });
+
         if (symbol_table.count(target->id) == 0) {
             llvm::CallSite call
                 = emitter.createCall(unw_info, g.funcs.assertNameDefined,
@@ -2147,7 +2196,7 @@ private:
 
         // Emitting the actual OSR:
         emitter.getBuilder()->SetInsertPoint(onramp);
-        OSREntryDescriptor* entry = OSREntryDescriptor::create(irstate->getCL(), osr_key, irstate->getExceptionStyle());
+        OSREntryDescriptor* entry = OSREntryDescriptor::create(irstate->getMD(), osr_key, irstate->getExceptionStyle());
         OSRExit* exit = new OSRExit(entry);
         llvm::Value* partial_func = emitter.getBuilder()->CreateCall(g.funcs.compilePartialFunc,
                                                                      embedRelocatablePtr(exit, g.i8->getPointerTo()));
@@ -2160,11 +2209,6 @@ private:
 
         sorted_symbol_table[internString(FRAME_INFO_PTR_NAME)]
             = new ConcreteCompilerVariable(FRAME_INFO, irstate->getFrameInfoVar(), true);
-
-        if (!irstate->getSourceInfo()->scoping->areGlobalsFromModule()) {
-            sorted_symbol_table[internString(PASSED_GLOBALS_NAME)]
-                = new ConcreteCompilerVariable(UNKNOWN, irstate->getGlobals(), true);
-        }
 
         // For OSR calls, we use the same calling convention as in some other places; namely,
         // arg1, arg2, arg3, argarray [nargs is ommitted]
@@ -2210,11 +2254,9 @@ private:
             ConcreteCompilerVariable* var = p.second->makeConverted(emitter, p.second->getConcreteType());
             converted_args.push_back(var);
 
-#if ENABLE_UNBOXED_VALUES
-            assert(var->getType() != BOXED_INT && "should probably unbox it, but why is it boxed in the first place?");
+            assert(var->getType() != BOXED_INT);
             assert(var->getType() != BOXED_FLOAT
                    && "should probably unbox it, but why is it boxed in the first place?");
-#endif
 
             // This line can never get hit right now for the same reason that the variables must already be
             // concrete,
@@ -2438,13 +2480,13 @@ private:
 
     void loadArgument(InternedString name, ConcreteCompilerType* t, llvm::Value* v, const UnwindInfo& unw_info) {
         assert(name.s() != FRAME_INFO_PTR_NAME);
-        ConcreteCompilerVariable* var = unboxVar(t, v, false);
+        CompilerVariable* var = unboxVar(t, v, false);
         _doSet(name, var, unw_info);
         var->decvref(emitter);
     }
 
     void loadArgument(AST_expr* name, ConcreteCompilerType* t, llvm::Value* v, const UnwindInfo& unw_info) {
-        ConcreteCompilerVariable* var = unboxVar(t, v, false);
+        CompilerVariable* var = unboxVar(t, v, false);
         _doSet(name, var, unw_info);
         var->decvref(emitter);
     }
@@ -2467,6 +2509,7 @@ private:
         std::map<InternedString, CompilerVariable*> sorted_symbol_table(symbol_table.begin(), symbol_table.end());
         for (const auto& p : sorted_symbol_table) {
             assert(p.first.s() != FRAME_INFO_PTR_NAME);
+            assert(p.second->getType()->isUsable());
             if (allowableFakeEndingSymbol(p.first))
                 continue;
 
@@ -2483,6 +2526,7 @@ private:
             } else if (irstate->getPhis()->isRequiredAfter(p.first, myblock)) {
                 assert(scope_info->getScopeTypeOfName(p.first) != ScopeInfo::VarScopeType::GLOBAL);
                 ConcreteCompilerType* phi_type = types->getTypeAtBlockEnd(p.first, myblock);
+                assert(phi_type->isUsable());
                 // printf("Converting %s from %s to %s\n", p.first.c_str(),
                 // p.second->getType()->debugName().c_str(), phi_type->debugName().c_str());
                 // printf("have to convert %s from %s to %s\n", p.first.c_str(),
@@ -2533,6 +2577,7 @@ private:
             } else {
                 // printf("no st entry, setting undefined\n");
                 ConcreteCompilerType* phi_type = types->getTypeAtBlockEnd(*it, myblock);
+                assert(phi_type->isUsable());
                 cur = new ConcreteCompilerVariable(phi_type, llvm::UndefValue::get(phi_type->llvmType()), true);
                 _setFake(defined_name, makeBool(0));
             }
@@ -2546,14 +2591,7 @@ public:
                               std::vector<llvm::Value*>& stackmap_args) override {
         int initial_args = stackmap_args.size();
 
-        stackmap_args.push_back(irstate->getFrameInfoVar());
-
-        if (!irstate->getSourceInfo()->scoping->areGlobalsFromModule()) {
-            stackmap_args.push_back(irstate->getGlobals());
-            pp->addFrameVar(PASSED_GLOBALS_NAME, UNKNOWN);
-        }
-
-        assert(INT->llvmType() == g.i64);
+        assert(UNBOXED_INT->llvmType() == g.i64);
         if (ENABLE_JIT_OBJECT_CACHE) {
             llvm::Value* v;
             if (current_stmt)
@@ -2565,9 +2603,10 @@ public:
             stackmap_args.push_back(getConstantInt((uint64_t)current_stmt, g.i64));
         }
 
-        pp->addFrameVar("!current_stmt", INT);
+        pp->addFrameVar("!current_stmt", UNBOXED_INT);
 
-        if (ENABLE_FRAME_INTROSPECTION) {
+        // For deopts we need to add the compiler created names to the stackmap
+        if (ENABLE_FRAME_INTROSPECTION && pp->isDeopt()) {
             // TODO: don't need to use a sorted symbol table if we're explicitly recording the names!
             // nice for debugging though.
             typedef std::pair<InternedString, CompilerVariable*> Entry;
@@ -2575,6 +2614,11 @@ public:
             std::sort(sorted_symbol_table.begin(), sorted_symbol_table.end(),
                       [](const Entry& lhs, const Entry& rhs) { return lhs.first < rhs.first; });
             for (const auto& p : sorted_symbol_table) {
+                // We never have to include non compiler generated vars because the user visible variables are stored
+                // inside the vregs array.
+                if (!p.first.isCompilerCreatedName())
+                    continue;
+
                 CompilerVariable* v = p.second;
                 v->serializeToFrame(stackmap_args);
                 pp->addFrameVar(p.first.s(), v->getType());
@@ -2599,6 +2643,10 @@ public:
 
         // This should have been consumed:
         assert(incoming_exc_state.empty());
+
+        for (auto&& p : symbol_table) {
+            ASSERT(p.second->getType()->isUsable(), "%s", p.first.c_str());
+        }
 
         if (myblock->successors.size() == 0) {
             for (auto& p : *st) {
@@ -2645,6 +2693,7 @@ public:
                 } else {
                     ending_type = types->getTypeAtBlockEnd(it->first, myblock);
                 }
+                assert(ending_type->isUsable());
                 //(*phi_st)[it->first] = it->second->makeConverted(emitter, it->second->getConcreteType());
                 // printf("%s %p %d\n", it->first.c_str(), it->second, it->second->getVrefs());
                 (*phi_st)[it->first] = it->second->split(emitter)->makeConverted(emitter, ending_type);
@@ -2661,10 +2710,9 @@ public:
         assert(name.s() != FRAME_INFO_PTR_NAME);
         ASSERT(irstate->getScopeInfo()->getScopeTypeOfName(name) != ScopeInfo::VarScopeType::GLOBAL, "%s",
                name.c_str());
-#if ENABLE_UNBOXED_VALUES
-        assert(var->getType() != BOXED_INT);
-        assert(var->getType() != BOXED_FLOAT);
-#endif
+
+        ASSERT(var->getType()->isUsable(), "%s", name.c_str());
+
         CompilerVariable*& cur = symbol_table[name];
         assert(cur == NULL);
         cur = var;
@@ -2675,7 +2723,9 @@ public:
         DupCache cache;
         for (SymbolTable::iterator it = st->begin(); it != st->end(); ++it) {
             // printf("Copying in %s: %p, %d\n", it->first.c_str(), it->second, it->second->getVrefs());
+            // printf("Copying in %s, a %s\n", it->first.c_str(), it->second->getType()->debugName().c_str());
             symbol_table[it->first] = it->second->dup(cache);
+            assert(symbol_table[it->first]->getType()->isUsable());
             // printf("got: %p, %d\n", symbol_table[it->first], symbol_table[it->first]->getVrefs());
         }
     }
@@ -2695,35 +2745,48 @@ public:
 
         auto scope_info = irstate->getScopeInfo();
 
-        llvm::Value* passed_closure = NULL;
+
         llvm::Function::arg_iterator AI = irstate->getLLVMFunction()->arg_begin();
+        llvm::Value* passed_closure = NULL;
+        llvm::Value* generator = NULL;
+        llvm::Value* globals = NULL;
 
         if (scope_info->takesClosure()) {
             passed_closure = AI;
-            symbol_table[internString(PASSED_CLOSURE_NAME)]
-                = new ConcreteCompilerVariable(getPassedClosureType(), AI, true);
+            ++AI;
+        } else
+            passed_closure = getNullPtr(g.llvm_closure_type_ptr);
+
+        if (irstate->getSourceInfo()->is_generator) {
+            generator = AI;
             ++AI;
         }
 
-        if (scope_info->createsClosure()) {
-            if (!passed_closure)
-                passed_closure = getNullPtr(g.llvm_closure_type_ptr);
+        if (!irstate->getSourceInfo()->scoping->areGlobalsFromModule()) {
+            globals = AI;
+            ++AI;
+        } else {
+            BoxedModule* parent_module = irstate->getSourceInfo()->parent_module;
+            globals = embedRelocatablePtr(parent_module, g.llvm_value_type_ptr, "cParentModule");
+        }
 
+        irstate->setupFrameInfoVar(passed_closure, globals);
+
+        if (scope_info->takesClosure()) {
+            symbol_table[internString(PASSED_CLOSURE_NAME)]
+                = new ConcreteCompilerVariable(getPassedClosureType(), passed_closure, true);
+        }
+
+        if (scope_info->createsClosure()) {
             llvm::Value* new_closure = emitter.getBuilder()->CreateCall2(
                 g.funcs.createClosure, passed_closure, getConstantInt(scope_info->getClosureSize(), g.i64));
             symbol_table[internString(CREATED_CLOSURE_NAME)]
                 = new ConcreteCompilerVariable(getCreatedClosureType(), new_closure, true);
         }
 
-        if (irstate->getSourceInfo()->is_generator) {
-            symbol_table[internString(PASSED_GENERATOR_NAME)] = new ConcreteCompilerVariable(GENERATOR, AI, true);
-            ++AI;
-        }
-
-        if (!irstate->getSourceInfo()->scoping->areGlobalsFromModule()) {
-            irstate->setGlobals(AI);
-            ++AI;
-        }
+        if (irstate->getSourceInfo()->is_generator)
+            symbol_table[internString(PASSED_GENERATOR_NAME)]
+                = new ConcreteCompilerVariable(GENERATOR, generator, true);
 
         std::vector<llvm::Value*> python_parameters;
         for (int i = 0; i < arg_types.size(); i++) {
@@ -2965,20 +3028,21 @@ IRGenerator* createIRGenerator(IRGenState* irstate, std::unordered_map<CFGBlock*
     return new IRGeneratorImpl(irstate, entry_blocks, myblock, types);
 }
 
-CLFunction* wrapFunction(AST* node, AST_arguments* args, const std::vector<AST_stmt*>& body, SourceInfo* source) {
+FunctionMetadata* wrapFunction(AST* node, AST_arguments* args, const std::vector<AST_stmt*>& body, SourceInfo* source) {
     // Different compilations of the parent scope of a functiondef should lead
-    // to the same CLFunction* being used:
-    static std::unordered_map<AST*, CLFunction*> made;
+    // to the same FunctionMetadata* being used:
+    static std::unordered_map<AST*, FunctionMetadata*> made;
 
-    CLFunction*& cl = made[node];
-    if (cl == NULL) {
+    FunctionMetadata*& md = made[node];
+    if (md == NULL) {
         std::unique_ptr<SourceInfo> si(
             new SourceInfo(source->parent_module, source->scoping, source->future_flags, node, body, source->getFn()));
         if (args)
-            cl = new CLFunction(args->args.size(), args->vararg.s().size(), args->kwarg.s().size(), std::move(si));
+            md = new FunctionMetadata(args->args.size(), args->vararg.s().size(), args->kwarg.s().size(),
+                                      std::move(si));
         else
-            cl = new CLFunction(0, false, false, std::move(si));
+            md = new FunctionMetadata(0, false, false, std::move(si));
     }
-    return cl;
+    return md;
 }
 }

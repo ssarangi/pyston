@@ -318,7 +318,7 @@ public:
 
 class RewriterAction {
 public:
-    SmallFunction<48> action;
+    SmallFunction<56> action;
 
     template <typename F> RewriterAction(F&& action) : action(std::forward<F>(action)) {}
 
@@ -489,7 +489,8 @@ protected:
     void _slowpathJump(bool condition_eq);
     void _trap();
     void _loadConst(RewriterVar* result, int64_t val);
-    void _setupCall(bool has_side_effects, llvm::ArrayRef<RewriterVar*> args, llvm::ArrayRef<RewriterVar*> args_xmm);
+    void _setupCall(bool has_side_effects, llvm::ArrayRef<RewriterVar*> args, llvm::ArrayRef<RewriterVar*> args_xmm,
+                    Location preserve = Location::any());
     void _call(RewriterVar* result, bool has_side_effects, void* func_addr, llvm::ArrayRef<RewriterVar*> args,
                llvm::ArrayRef<RewriterVar*> args_xmm);
     void _add(RewriterVar* result, RewriterVar* a, int64_t b, Location dest);
@@ -595,11 +596,11 @@ public:
 
     void addDependenceOn(ICInvalidator&);
 
-    void gc_visit(gc::GCVisitor* visitor);
+    void gc_visit(gc::GCVisitor* visitor) override;
 
     static Rewriter* createRewriter(void* rtn_addr, int num_args, const char* debug_name);
 
-    static bool isLargeConstant(int64_t val) { return (val < (-1L << 31) || val >= (1L << 31) - 1); }
+    static bool isLargeConstant(int64_t val) { return !fitsInto<int32_t>(val); }
 
     // The "aggressiveness" with which we should try to do this rewrite.  It starts high, and decreases over time.
     // The values are nominally in the range 0-100, with 0 being no aggressiveness and 100 being fully aggressive,

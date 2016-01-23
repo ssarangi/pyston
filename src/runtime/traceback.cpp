@@ -61,7 +61,7 @@ void printTraceback(Box* b) {
 
     for (; tb && tb != None; tb = static_cast<BoxedTraceback*>(tb->tb_next)) {
         auto& line = tb->line;
-        fprintf(stderr, "  File \"%s\", line %d, in %s:\n", line.file->c_str(), line.line, line.func->c_str());
+        fprintf(stderr, "  File \"%s\", line %d, in %s\n", line.file->c_str(), line.line, line.func->c_str());
 
         if (line.line < 0)
             continue;
@@ -119,11 +119,32 @@ void BoxedTraceback::here(LineInfo lineInfo, Box** tb) {
     *tb = new BoxedTraceback(std::move(lineInfo), *tb);
 }
 
+static Box* traceback_tb_next(Box* self, void*) {
+    assert(self->cls == traceback_cls);
+
+    BoxedTraceback* traceback = static_cast<BoxedTraceback*>(self);
+    return traceback->tb_next;
+}
+
+extern "C" int _Py_DisplaySourceLine(PyObject* f, const char* filename, int lineno, int indent) noexcept {
+    RELEASE_ASSERT(0, "Not implemented.");
+}
+
 void setupTraceback() {
     traceback_cls = BoxedClass::create(type_cls, object_cls, BoxedTraceback::gcHandler, 0, 0, sizeof(BoxedTraceback),
                                        false, "traceback");
 
-    traceback_cls->giveAttr("getLines", new BoxedFunction(boxRTFunction((void*)BoxedTraceback::getLines, UNKNOWN, 1)));
+    traceback_cls->giveAttr("getLines",
+                            new BoxedFunction(FunctionMetadata::create((void*)BoxedTraceback::getLines, UNKNOWN, 1)));
+
+    /*
+     * Currently not supported.
+    traceback_cls->giveAttr("tb_frame", new (pyston_getset_cls) BoxedGetsetDescriptor(traceback_tb_frame, NULL, NULL));
+    traceback_cls->giveAttr("tb_lasti", new (pyston_getset_cls) BoxedGetsetDescriptor(traceback_tb_lasti, NULL, NULL));
+    traceback_cls->giveAttr("tb_lineno", new (pyston_getset_cls) BoxedGetsetDescriptor(traceback_tb_lineno, NULL,
+    NULL));
+    */
+    traceback_cls->giveAttrDescriptor("tb_next", traceback_tb_next, NULL);
 
     traceback_cls->freeze();
 }

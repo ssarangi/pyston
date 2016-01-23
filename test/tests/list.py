@@ -61,7 +61,7 @@ list_index = [1, 2, 3, 4, 5]
 for i in xrange(1, 6):
     assert list_index.index(i) == i-1
     try:
-        print list_index.index(i, 3, 4)
+        print list_index.index(i, 3L, 4L)
     except ValueError as e:
         print e
     try:
@@ -85,7 +85,7 @@ while l:
     del l[0]
 
 l = range(5)
-l.extend(range(5))
+print l.extend(range(5))
 print l
 
 # Repeating a list
@@ -167,6 +167,8 @@ l = range(5)
 l[2:4] = tuple(range(2))
 print l
 
+l[::-1] = l
+print l
 
 l = [None]*4
 try:

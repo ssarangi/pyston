@@ -430,7 +430,9 @@ typedef PyObject *(*allocfunc)(PyTypeObject *, Py_ssize_t);
     destructor tp_del;\
                                                                                 \
     /* Type attribute cache version tag. Added in version 2.6 */\
-    unsigned int tp_version_tag;    \
+    /* Pyston change: change uint to 64bit uint
+    unsigned int tp_version_tag; */    \
+    PY_UINT64_T tp_version_tag;        \
 \
     /* Pyston changes: added these fields */ \
 
@@ -454,10 +456,10 @@ struct _typeobject {
 
     void* _hcls;
     void* _hcattrs;
-    char _ics[32];
+    char _ics[40];
     void* _gcvisit_func;
     int _attrs_offset;
-    bool _flags[7];
+    char _flags[7]; // These are bools in C++
     void* _tpp_descr_get;
     void* _tpp_hasnext;
     void* _tpp_call_capi;

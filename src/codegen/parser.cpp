@@ -14,6 +14,8 @@
 
 #include "codegen/parser.h"
 
+#include "cpython_ast.h"
+
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +34,7 @@
 #include "core/stats.h"
 #include "core/types.h"
 #include "core/util.h"
+#include "runtime/types.h"
 
 //#undef VERBOSITY
 //#define VERBOSITY(x) 2
@@ -1015,13 +1018,27 @@ static std::string getParserCommandLine(const char* fn) {
 AST_Module* parse_string(const char* code, FutureFlags inherited_flags) {
     inherited_flags &= ~(CO_NESTED | CO_FUTURE_DIVISION);
 
+    if (ENABLE_CPYTHON_PARSER) {
+        PyCompilerFlags cf;
+        cf.cf_flags = inherited_flags;
+        ArenaWrapper arena;
+        assert(arena);
+        const char* fn = "<string>";
+        mod_ty mod = PyParser_ASTFromString(code, fn, Py_file_input, &cf, arena);
+        if (!mod)
+            throwCAPIException();
+        assert(mod->kind != Interactive_kind);
+        auto rtn = static_cast<AST_Module*>(cpythonToPystonAST(mod, fn));
+        return rtn;
+    }
+
     if (ENABLE_PYPA_PARSER || inherited_flags) {
         AST_Module* rtn = pypa_parse_string(code, inherited_flags);
         RELEASE_ASSERT(rtn, "unknown parse error (possibly: '%s'?)", strerror(errno));
         return rtn;
     }
 
-    ASSERT(!inherited_flags, "the old cpython parser doesn't support specifying initial future flags");
+    RELEASE_ASSERT(!inherited_flags, "the old cpython parser doesn't support specifying initial future flags");
 
     int size = strlen(code);
     char buf[] = "pystontmp_XXXXXX";
@@ -1032,10 +1049,11 @@ AST_Module* parse_string(const char* code, FutureFlags inherited_flags) {
         printf("writing %d bytes to %s\n", size, tmp.c_str());
     }
 
-    FILE* f = fopen(tmp.c_str(), "w");
-    fwrite(code, 1, size, f);
-    fputc('\n', f);
-    fclose(f);
+    {
+        FileHandle f(tmp.c_str(), "w");
+        fwrite(code, 1, size, f);
+        fputc('\n', f);
+    }
 
     AST_Module* m = parse_file(tmp.c_str(), inherited_flags);
     removeDirectoryIfExists(tmpdir);
@@ -1045,6 +1063,20 @@ AST_Module* parse_string(const char* code, FutureFlags inherited_flags) {
 
 AST_Module* parse_file(const char* fn, FutureFlags inherited_flags) {
     Timer _t("parsing");
+
+    if (ENABLE_CPYTHON_PARSER) {
+        FileHandle fp(fn, "r");
+        PyCompilerFlags cf;
+        cf.cf_flags = inherited_flags;
+        ArenaWrapper arena;
+        assert(arena);
+        mod_ty mod = PyParser_ASTFromFile(fp, fn, Py_file_input, 0, 0, &cf, NULL, arena);
+        if (!mod)
+            throwCAPIException();
+        assert(mod->kind != Interactive_kind);
+        auto rtn = static_cast<AST_Module*>(cpythonToPystonAST(mod, fn));
+        return rtn;
+    }
 
     if (ENABLE_PYPA_PARSER) {
         AST_Module* rtn = pypa_parse(fn, inherited_flags);
@@ -1073,10 +1105,12 @@ AST_Module* parse_file(const char* fn, FutureFlags inherited_flags) {
 }
 
 const char* getMagic() {
-    if (ENABLE_PYPA_PARSER)
-        return "a\ncN";
+    if (ENABLE_CPYTHON_PARSER)
+        return "a\nCO";
+    else if (ENABLE_PYPA_PARSER)
+        return "a\ncO";
     else
-        return "a\ncn";
+        return "a\nco";
 }
 
 #define MAGIC_STRING_LENGTH 4
@@ -1087,7 +1121,7 @@ const char* getMagic() {
 static std::vector<char> _reparse(const char* fn, const std::string& cache_fn, AST_Module*& module,
                                   FutureFlags inherited_flags) {
     inherited_flags &= ~(CO_NESTED | CO_FUTURE_DIVISION);
-    FILE* cache_fp = fopen(cache_fn.c_str(), "w");
+    FileHandle cache_fp(cache_fn.c_str(), "w");
 
     if (DEBUG_PARSING) {
         fprintf(stderr, "_reparse('%s', '%s'), pypa=%d\n", fn, cache_fn.c_str(), ENABLE_PYPA_PARSER);
@@ -1116,9 +1150,22 @@ static std::vector<char> _reparse(const char* fn, const std::string& cache_fn, A
     file_data.insert(file_data.end(), (char*)&checksum, (char*)&checksum + CHECKSUM_LENGTH);
     checksum = 0;
 
-    if (ENABLE_PYPA_PARSER || inherited_flags) {
-        module = pypa_parse(fn, inherited_flags);
-        RELEASE_ASSERT(module, "unknown parse error");
+    if (ENABLE_CPYTHON_PARSER || ENABLE_PYPA_PARSER || inherited_flags) {
+        if (ENABLE_CPYTHON_PARSER) {
+            FileHandle fp(fn, "r");
+            PyCompilerFlags cf;
+            cf.cf_flags = inherited_flags;
+            ArenaWrapper arena;
+            assert(arena);
+            mod_ty mod = PyParser_ASTFromFile(fp, fn, Py_file_input, 0, 0, &cf, NULL, arena);
+            if (!mod)
+                throwCAPIException();
+            assert(mod->kind != Interactive_kind);
+            module = static_cast<AST_Module*>(cpythonToPystonAST(mod, fn));
+        } else {
+            module = pypa_parse(fn, inherited_flags);
+            RELEASE_ASSERT(module, "unknown parse error");
+        }
 
         if (!cache_fp)
             return std::vector<char>();
@@ -1127,7 +1174,7 @@ static std::vector<char> _reparse(const char* fn, const std::string& cache_fn, A
         checksum = p.second;
         bytes_written += p.first;
     } else {
-        ASSERT(!inherited_flags, "the old cpython parser doesn't support specifying initial future flags");
+        RELEASE_ASSERT(!inherited_flags, "the old cpython parser doesn't support specifying initial future flags");
         FILE* parser = popen(getParserCommandLine(fn).c_str(), "r");
         char buf[80];
         while (true) {
@@ -1156,9 +1203,7 @@ static std::vector<char> _reparse(const char* fn, const std::string& cache_fn, A
         fwrite(&checksum, 1, CHECKSUM_LENGTH, cache_fp);
     memcpy(&file_data[checksum_start + LENGTH_LENGTH], &checksum, CHECKSUM_LENGTH);
 
-    if (cache_fp)
-        fclose(cache_fp);
-    return std::move(file_data);
+    return file_data;
 }
 
 // Parsing the file is somewhat expensive since we have to shell out to cpython;
@@ -1189,7 +1234,8 @@ AST_Module* caching_parse_file(const char* fn, FutureFlags inherited_flags) {
                           && cache_stat.st_mtim.tv_nsec > source_stat.st_mtim.tv_nsec))) {
         oss << "reading pyc file\n";
         char buf[1024];
-        FILE* cache_fp = fopen(cache_fn.c_str(), "r");
+
+        FileHandle cache_fp(cache_fn.c_str(), "r");
         if (cache_fp) {
             while (true) {
                 int read = fread(buf, 1, 1024, cache_fp);
@@ -1207,7 +1253,6 @@ AST_Module* caching_parse_file(const char* fn, FutureFlags inherited_flags) {
                     break;
                 }
             }
-            fclose(cache_fp);
         }
     }
 

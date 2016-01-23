@@ -15,6 +15,8 @@
 #ifndef PYSTON_CODEGEN_IRGEN_H
 #define PYSTON_CODEGEN_IRGEN_H
 
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
@@ -100,6 +102,8 @@ public:
     virtual void checkAndPropagateCapiException(const UnwindInfo& unw_info, llvm::Value* returned_val,
                                                 llvm::Value* exc_val, bool double_check = false) = 0;
 
+    virtual llvm::Value* createDeopt(AST_stmt* current_stmt, AST_expr* node, llvm::Value* node_value) = 0;
+
     virtual Box* getIntConstant(int64_t n) = 0;
     virtual Box* getFloatConstant(double d) = 0;
 };
@@ -111,7 +115,7 @@ extern const std::string PASSED_GENERATOR_NAME;
 InternedString getIsDefinedName(InternedString name, InternedStringPool& interned_strings);
 bool isIsDefinedName(llvm::StringRef name);
 
-CompiledFunction* doCompile(CLFunction* clfunc, SourceInfo* source, ParamNames* param_names,
+CompiledFunction* doCompile(FunctionMetadata* md, SourceInfo* source, ParamNames* param_names,
                             const OSREntryDescriptor* entry_descriptor, EffortLevel effort,
                             ExceptionStyle exception_style, FunctionSpecialization* spec, llvm::StringRef nameprefix);
 
@@ -139,16 +143,47 @@ class OpInfo {
 private:
     const EffortLevel effort;
     TypeRecorder* const type_recorder;
+    ICInfo* bjit_ic_info;
 
 public:
     const UnwindInfo unw_info;
 
-    OpInfo(EffortLevel effort, TypeRecorder* type_recorder, const UnwindInfo& unw_info)
-        : effort(effort), type_recorder(type_recorder), unw_info(unw_info) {}
+    OpInfo(EffortLevel effort, TypeRecorder* type_recorder, const UnwindInfo& unw_info, ICInfo* bjit_ic_info)
+        : effort(effort), type_recorder(type_recorder), bjit_ic_info(bjit_ic_info), unw_info(unw_info) {}
 
     TypeRecorder* getTypeRecorder() const { return type_recorder; }
+    ICInfo* getBJitICInfo() const { return bjit_ic_info; }
 
     ExceptionStyle preferredExceptionStyle() const { return unw_info.preferredExceptionStyle(); }
+};
+
+
+class PystonObjectCache : public llvm::ObjectCache {
+private:
+    llvm::SmallString<128> cache_dir;
+    std::string module_identifier;
+    std::string hash_before_codegen;
+
+public:
+    PystonObjectCache();
+
+
+#if LLVMREV < 216002
+    virtual void notifyObjectCompiled(const llvm::Module* M, const llvm::MemoryBuffer* Obj);
+#else
+    virtual void notifyObjectCompiled(const llvm::Module* M, llvm::MemoryBufferRef Obj);
+#endif
+
+#if LLVMREV < 215566
+    virtual llvm::MemoryBuffer* getObject(const llvm::Module* M);
+#else
+    virtual std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module* M);
+#endif
+
+    void cleanupCacheDirectory();
+
+    void calculateModuleHash(const llvm::Module* M, EffortLevel effort);
+    bool haveCacheFileForHash();
 };
 }
 

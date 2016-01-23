@@ -97,8 +97,9 @@ void generatorEntry(BoxedGenerator* g) {
             BoxedFunctionBase* func = g->function;
 
             Box** args = g->args ? &g->args->elts[0] : nullptr;
-            callCLFunc<ExceptionStyle::CXX, NOT_REWRITABLE>(func->f, nullptr, func->f->numReceivedArgs(), func->closure,
-                                                            g, func->globals, g->arg1, g->arg2, g->arg3, args);
+            callCLFunc<ExceptionStyle::CXX, NOT_REWRITABLE>(func->md, nullptr, func->md->numReceivedArgs(),
+                                                            func->closure, g, func->globals, g->arg1, g->arg2, g->arg3,
+                                                            args);
         } catch (ExcInfo e) {
             // unhandled exception: propagate the exception to the caller
             g->exception = e;
@@ -288,7 +289,7 @@ template <ExceptionStyle S> static Box* generatorNext(Box* s) noexcept(S == CAPI
     return generatorSend<S>(s, None);
 }
 
-i1 generatorHasnextUnboxed(Box* s) {
+llvm_compat_bool generatorHasnextUnboxed(Box* s) {
     assert(s->cls == generator_cls);
     BoxedGenerator* self = static_cast<BoxedGenerator*>(s);
 
@@ -354,7 +355,7 @@ extern "C" BoxedGenerator::BoxedGenerator(BoxedFunctionBase* function, Box* arg1
 #endif
 {
 
-    int numArgs = function->f->numReceivedArgs();
+    int numArgs = function->md->numReceivedArgs();
     if (numArgs > 3) {
         numArgs -= 3;
         this->args = new (numArgs) GCdArray();
@@ -428,18 +429,19 @@ void BoxedGenerator::gcHandler(GCVisitor* v, Box* b) {
     BoxedGenerator* g = (BoxedGenerator*)b;
 
     v->visit(&g->function);
-    int num_args = g->function->f->numReceivedArgs();
+    int num_args = g->function->md->numReceivedArgs();
     if (num_args >= 1)
         v->visit(&g->arg1);
     if (num_args >= 2)
         v->visit(&g->arg2);
     if (num_args >= 3)
         v->visit(&g->arg3);
-    if (g->args)
+    if (g->args) {
         v->visit(&g->args);
-    if (num_args > 3)
-        v->visitPotentialRange(reinterpret_cast<void**>(&g->args->elts[0]),
-                               reinterpret_cast<void**>(&g->args->elts[num_args - 3]));
+        if (num_args > 3)
+            v->visitPotentialRange(reinterpret_cast<void**>(&g->args->elts[0]),
+                                   reinterpret_cast<void**>(&g->args->elts[num_args - 3]));
+    }
     if (g->returnValue)
         v->visit(&g->returnValue);
     if (g->exception.type)
@@ -467,7 +469,7 @@ Box* generatorName(Box* _self, void* context) {
     assert(isSubclass(_self->cls, generator_cls));
     BoxedGenerator* self = static_cast<BoxedGenerator*>(_self);
 
-    return self->function->f->source->getName();
+    return self->function->md->source->getName();
 }
 
 void generatorDestructor(Box* b) {
@@ -482,24 +484,25 @@ void setupGenerator() {
                              sizeof(BoxedGenerator), false, "generator");
     generator_cls->tp_dealloc = generatorDestructor;
     generator_cls->has_safe_tp_dealloc = true;
-    generator_cls->giveAttr("__iter__",
-                            new BoxedFunction(boxRTFunction((void*)generatorIter, typeFromClass(generator_cls), 1)));
+    generator_cls->giveAttr(
+        "__iter__", new BoxedFunction(FunctionMetadata::create((void*)generatorIter, typeFromClass(generator_cls), 1)));
 
-    generator_cls->giveAttr("close", new BoxedFunction(boxRTFunction((void*)generatorClose, UNKNOWN, 1)));
+    generator_cls->giveAttr("close", new BoxedFunction(FunctionMetadata::create((void*)generatorClose, UNKNOWN, 1)));
 
-    auto generator_next = boxRTFunction((void*)generatorNext<CXX>, UNKNOWN, 1, ParamNames::empty(), CXX);
-    addRTFunction(generator_next, (void*)generatorNext<CAPI>, UNKNOWN, CAPI);
+    auto generator_next = FunctionMetadata::create((void*)generatorNext<CXX>, UNKNOWN, 1, ParamNames::empty(), CXX);
+    generator_next->addVersion((void*)generatorNext<CAPI>, UNKNOWN, CAPI);
     generator_cls->giveAttr("next", new BoxedFunction(generator_next));
 
-    CLFunction* hasnext = boxRTFunction((void*)generatorHasnextUnboxed, BOOL, 1);
-    addRTFunction(hasnext, (void*)generatorHasnext, BOXED_BOOL);
+    FunctionMetadata* hasnext = FunctionMetadata::create((void*)generatorHasnextUnboxed, BOOL, 1);
+    hasnext->addVersion((void*)generatorHasnext, BOXED_BOOL);
     generator_cls->giveAttr("__hasnext__", new BoxedFunction(hasnext));
 
-    generator_cls->giveAttr("send", new BoxedFunction(boxRTFunction((void*)generatorSend<CXX>, UNKNOWN, 2)));
-    auto gthrow = new BoxedFunction(boxRTFunction((void*)generatorThrow, UNKNOWN, 4, false, false), { NULL, NULL });
+    generator_cls->giveAttr("send", new BoxedFunction(FunctionMetadata::create((void*)generatorSend<CXX>, UNKNOWN, 2)));
+    auto gthrow
+        = new BoxedFunction(FunctionMetadata::create((void*)generatorThrow, UNKNOWN, 4, false, false), { NULL, NULL });
     generator_cls->giveAttr("throw", gthrow);
 
-    generator_cls->giveAttr("__name__", new (pyston_getset_cls) BoxedGetsetDescriptor(generatorName, NULL, NULL));
+    generator_cls->giveAttrDescriptor("__name__", generatorName, NULL);
 
     generator_cls->freeze();
     generator_cls->tp_iter = PyObject_SelfIter;

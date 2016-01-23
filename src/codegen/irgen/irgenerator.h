@@ -49,7 +49,6 @@ extern const std::string CREATED_CLOSURE_NAME;
 extern const std::string PASSED_CLOSURE_NAME;
 extern const std::string PASSED_GENERATOR_NAME;
 extern const std::string FRAME_INFO_PTR_NAME;
-extern const std::string PASSED_GLOBALS_NAME;
 
 
 // Class that holds state of the current IR generation, that might not be local
@@ -57,9 +56,9 @@ extern const std::string PASSED_GLOBALS_NAME;
 // TODO this probably shouldn't be here
 class IRGenState {
 private:
-    // Note: due to some not-yet-fixed behavior, cf->clfunc is NULL will only get set to point
-    // to clfunc at the end of irgen.
-    CLFunction* clfunc;
+    // Note: due to some not-yet-fixed behavior, cf->md is NULL will only get set to point
+    // to md at the end of irgen.
+    FunctionMetadata* md;
     CompiledFunction* cf;
     SourceInfo* source_info;
     std::unique_ptr<PhiAnalysis> phis;
@@ -70,17 +69,18 @@ private:
     llvm::AllocaInst* scratch_space;
     llvm::Value* frame_info;
     llvm::Value* boxed_locals;
-    llvm::Value* frame_info_arg;
     llvm::Value* globals;
+    llvm::Value* vregs;
+    llvm::Value* stmt;
     int scratch_size;
 
 public:
-    IRGenState(CLFunction* clfunc, CompiledFunction* cf, SourceInfo* source_info, std::unique_ptr<PhiAnalysis> phis,
+    IRGenState(FunctionMetadata* md, CompiledFunction* cf, SourceInfo* source_info, std::unique_ptr<PhiAnalysis> phis,
                ParamNames* param_names, GCBuilder* gc, llvm::MDNode* func_dbg_info);
     ~IRGenState();
 
     CompiledFunction* getCurFunction() { return cf; }
-    CLFunction* getCL() { return clfunc; }
+    FunctionMetadata* getMD() { return md; }
 
     ExceptionStyle getExceptionStyle() { return cf->exception_style; }
 
@@ -90,9 +90,15 @@ public:
 
     GCBuilder* getGC() { return gc; }
 
+    void setupFrameInfoVar(llvm::Value* passed_closure, llvm::Value* passed_globals,
+                           llvm::Value* frame_info_arg = NULL);
+    void setupFrameInfoVarOSR(llvm::Value* frame_info_arg) { return setupFrameInfoVar(NULL, NULL, frame_info_arg); }
+
     llvm::Value* getScratchSpace(int min_bytes);
     llvm::Value* getFrameInfoVar();
     llvm::Value* getBoxedLocalsVar();
+    llvm::Value* getVRegsVar();
+    llvm::Value* getStmtVar();
 
     ConcreteCompilerType* getReturnType() { return cf->getReturnType(); }
 
@@ -108,9 +114,6 @@ public:
 
     ParamNames* getParamNames() { return param_names; }
 
-    void setFrameInfoArgument(llvm::Value* v) { frame_info_arg = v; }
-
-    void setGlobals(llvm::Value* globals);
     // Returns the custom globals, or the module if the globals come from the module.
     llvm::Value* getGlobals();
     // Returns the custom globals, or null if the globals come from the module.
@@ -170,7 +173,7 @@ IREmitter* createIREmitter(IRGenState* irstate, llvm::BasicBlock*& curblock, IRG
 IRGenerator* createIRGenerator(IRGenState* irstate, std::unordered_map<CFGBlock*, llvm::BasicBlock*>& entry_blocks,
                                CFGBlock* myblock, TypeAnalysis* types);
 
-CLFunction* wrapFunction(AST* node, AST_arguments* args, const std::vector<AST_stmt*>& body, SourceInfo* source);
+FunctionMetadata* wrapFunction(AST* node, AST_arguments* args, const std::vector<AST_stmt*>& body, SourceInfo* source);
 std::vector<BoxedString*>* getKeywordNameStorage(AST_Call* node);
 }
 

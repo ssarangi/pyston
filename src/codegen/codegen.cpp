@@ -30,6 +30,7 @@
 #include "codegen/baseline_jit.h"
 #include "codegen/compvars.h"
 #include "core/ast.h"
+#include "core/cfg.h"
 #include "core/util.h"
 #include "runtime/code.h"
 #include "runtime/types.h"
@@ -38,7 +39,8 @@ namespace pyston {
 
 DS_DEFINE_RWLOCK(codegen_rwlock);
 
-CLFunction::CLFunction(int num_args, bool takes_varargs, bool takes_kwargs, std::unique_ptr<SourceInfo> source)
+FunctionMetadata::FunctionMetadata(int num_args, bool takes_varargs, bool takes_kwargs,
+                                   std::unique_ptr<SourceInfo> source)
     : code_obj(NULL),
       num_args(num_args),
       takes_varargs(takes_varargs),
@@ -50,7 +52,7 @@ CLFunction::CLFunction(int num_args, bool takes_varargs, bool takes_kwargs, std:
       internal_callable(NULL, NULL) {
 }
 
-CLFunction::CLFunction(int num_args, bool takes_varargs, bool takes_kwargs, const ParamNames& param_names)
+FunctionMetadata::FunctionMetadata(int num_args, bool takes_varargs, bool takes_kwargs, const ParamNames& param_names)
     : code_obj(NULL),
       num_args(num_args),
       takes_varargs(takes_varargs),
@@ -62,21 +64,35 @@ CLFunction::CLFunction(int num_args, bool takes_varargs, bool takes_kwargs, cons
       internal_callable(NULL, NULL) {
 }
 
-BoxedCode* CLFunction::getCode() {
+BoxedCode* FunctionMetadata::getCode() {
     if (!code_obj) {
         code_obj = new BoxedCode(this);
-        // CLFunctions don't currently participate in GC.  They actually never get freed currently.
+        // FunctionMetadatas don't currently participate in GC.  They actually never get freed currently.
         gc::registerPermanentRoot(code_obj);
     }
     return code_obj;
 }
 
-void CLFunction::addVersion(CompiledFunction* compiled) {
+int FunctionMetadata::calculateNumVRegs() {
+    SourceInfo* source_info = source.get();
+
+    CFG* cfg = source_info->cfg;
+    assert(cfg && "We don't calculate the CFG inside this function because it can raise an exception and its "
+                  "therefore not safe to call at every point");
+
+    if (!cfg->hasVregsAssigned()) {
+        ScopeInfo* scope_info = source->getScopeInfo();
+        cfg->assignVRegs(param_names, scope_info);
+    }
+    return cfg->sym_vreg_map.size();
+}
+
+void FunctionMetadata::addVersion(CompiledFunction* compiled) {
     assert(compiled);
     assert((compiled->spec != NULL) + (compiled->entry_descriptor != NULL) == 1);
-    assert(compiled->clfunc == NULL);
+    assert(compiled->md == NULL);
     assert(compiled->code);
-    compiled->clfunc = this;
+    compiled->md = this;
 
     if (compiled->entry_descriptor == NULL) {
         bool could_have_speculations = (source.get() != NULL);
@@ -100,7 +116,7 @@ SourceInfo::SourceInfo(BoxedModule* m, ScopingAnalysis* scoping, FutureFlags fut
       ast(ast),
       cfg(NULL),
       body(std::move(body)) {
-    assert(fn->size());
+    assert(fn);
     // TODO: we should track this reference correctly rather than making it a root
     gc::registerPermanentRoot(fn, true);
     this->fn = fn;

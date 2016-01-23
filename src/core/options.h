@@ -21,9 +21,7 @@ extern "C" {
 
 extern int GLOBAL_VERBOSITY;
 #define VERBOSITY(x) pyston::GLOBAL_VERBOSITY
-extern int PYSTON_VERSION_MAJOR, PYSTON_VERSION_MINOR;
-// Version number we're targeting:
-extern int PYTHON_VERSION_MAJOR, PYTHON_VERSION_MINOR, PYTHON_VERSION_MICRO, PYTHON_VERSION_HEX;
+extern int PYSTON_VERSION_MAJOR, PYSTON_VERSION_MINOR, PYSTON_VERSION_MICRO;
 
 inline int version_hex(int major, int minor, int micro, int level = 0, int serial = 0) {
     return (major << 24) | (minor << 16) | (micro << 8) | (level << 4) | (serial << 0);
@@ -38,8 +36,9 @@ extern int SPECULATION_THRESHOLD;
 extern int MAX_OBJECT_CACHE_ENTRIES;
 
 extern bool SHOW_DISASM, FORCE_INTERPRETER, FORCE_OPTIMIZE, PROFILE, DUMPJIT, TRAP, USE_STRIPPED_STDLIB,
-    CONTINUE_AFTER_FATAL, ENABLE_INTERPRETER, ENABLE_BASELINEJIT, ENABLE_PYPA_PARSER, USE_REGALLOC_BASIC,
-    PAUSE_AT_ABORT, ENABLE_TRACEBACKS, ASSEMBLY_LOGGING, FORCE_LLVM_CAPI_CALLS, FORCE_LLVM_CAPI_THROWS;
+    CONTINUE_AFTER_FATAL, ENABLE_INTERPRETER, ENABLE_BASELINEJIT, ENABLE_PYPA_PARSER, ENABLE_CPYTHON_PARSER,
+    USE_REGALLOC_BASIC, PAUSE_AT_ABORT, ENABLE_TRACEBACKS, ASSEMBLY_LOGGING, FORCE_LLVM_CAPI_CALLS,
+    FORCE_LLVM_CAPI_THROWS;
 
 extern bool ENABLE_ICS, ENABLE_ICGENERICS, ENABLE_ICGETITEMS, ENABLE_ICSETITEMS, ENABLE_ICDELITEMS, ENABLE_ICBINEXPS,
     ENABLE_ICNONZEROS, ENABLE_ICCALLSITES, ENABLE_ICSETATTRS, ENABLE_ICGETATTRS, ENALBE_ICDELATTRS, ENABLE_ICGETGLOBALS,
@@ -48,15 +47,9 @@ extern bool ENABLE_ICS, ENABLE_ICGENERICS, ENABLE_ICGETITEMS, ENABLE_ICSETITEMS,
     LAZY_SCOPING_ANALYSIS;
 
 // Due to a temporary LLVM limitation, represent bools as i64's instead of i1's.
-extern bool BOOLS_AS_I64;
+#define BOOLS_AS_I64 1
 
 #define ENABLE_SAMPLING_PROFILER 0
-
-// Our current implementation of unbox values has some minor compatibility issues, where it can
-// change the apparent id() / is-equality of a boxed value (by inserting extra unbox+box pairs).
-// I think it can be rescued (we need the unboxed compilertype to remember the boxed value),
-// but for now it's just turned off with this flag.
-#define ENABLE_UNBOXED_VALUES 0
 }
 }
 

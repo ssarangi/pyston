@@ -388,7 +388,7 @@ float_repr(PyFloatObject *v)
     return float_str_or_repr(v, 0, 'r');
 }
 
-static PyObject *
+PyObject *
 float_str(PyFloatObject *v)
 {
     return float_str_or_repr(v, PyFloat_STR_PRECISION, 'g');
@@ -747,7 +747,8 @@ float_rem(PyObject *v, PyObject *w)
     return PyFloat_FromDouble(mod);
 }
 
-static PyObject *
+// pyston change: make this not static
+PyObject *
 float_divmod(PyObject *v, PyObject *w)
 {
     double vx, wx;
@@ -987,7 +988,8 @@ float_nonzero(PyFloatObject *v)
     return v->ob_fval != 0.0;
 }
 
-static int
+// pyston change: make not static
+int
 float_coerce(PyObject **pv, PyObject **pw)
 {
     if (PyInt_Check(*pw)) {
@@ -1120,8 +1122,6 @@ float_long(PyObject *v)
 #error "C doubles do not appear to be IEEE 754 binary64 format"
 #endif
 
-// pyston change: comment this out
-#if 0
 PyObject *
 _Py_double_round(double x, int ndigits) {
 
@@ -1258,7 +1258,6 @@ _Py_double_round(double x, int ndigits) {
     _Py_dg_freedtoa(buf);
     return result;
 }
-#endif
 
 #undef FIVE_POW_LIMIT
 
@@ -1952,7 +1951,8 @@ PyDoc_STRVAR(float_getformat_doc,
 "'unknown', 'IEEE, big-endian' or 'IEEE, little-endian' best describes the\n"
 "format of floating point numbers used by the C type named by typestr.");
 
-static PyObject *
+// pyston change: make not static
+PyObject *
 float_setformat(PyTypeObject *v, PyObject* args)
 {
     char* typestr;

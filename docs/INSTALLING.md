@@ -14,26 +14,26 @@ sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test
 sudo add-apt-repository --yes ppa:kubuntu-ppa/backports
 sudo apt-get -qq update
 
-sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev autoconf libtool python-dev texlive-extra-utils clang-3.4 libstdc++-4.8-dev libssl-dev libsqlite3-dev pkg-config libbz2-dev
+sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev libmpfr-dev autoconf libtool python-dev texlive-extra-utils clang-3.4 libstdc++-4.8-dev libssl-dev libsqlite3-dev pkg-config libbz2-dev
 ```
 
 
 **Ubuntu 14.04/14.10/15.04**
 ```
-sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev autoconf libtool python-dev texlive-extra-utils clang libssl-dev libsqlite3-dev pkg-config libbz2-dev
+sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev libmpfr-dev autoconf libtool python-dev texlive-extra-utils clang libssl-dev libsqlite3-dev pkg-config libbz2-dev
 ```
 
 **Fedora 21**
 ```
-sudo yum install git make cmake clang gcc gcc-c++ ccache ninja-build xz-devel automake libtool gmp-devel readline-devel openssl-devel sqlite-devel python-devel zlib-devel bzip2-devel ncurses-devel texlive-latex2man libffi-devel
+sudo yum install git make cmake clang gcc gcc-c++ ccache ninja-build xz-devel automake libtool gmp-devel mpfr-devel readline-devel openssl-devel sqlite-devel python-devel zlib-devel bzip2-devel ncurses-devel texlive-latex2man libffi-devel
 ```
 
 ### Building and testing
 ```
 git clone https://github.com/dropbox/pyston.git ~/pyston
 
-git clone git://github.com/llvm-mirror/llvm.git ~/pyston_deps/llvm-trunk
-git clone git://github.com/llvm-mirror/clang.git ~/pyston_deps/llvm-trunk/tools/clang
+git clone https://github.com/llvm-mirror/llvm.git ~/pyston_deps/llvm-trunk
+git clone https://github.com/llvm-mirror/clang.git ~/pyston_deps/llvm-trunk/tools/clang
 
 git config --global user.email "you@example.com"
 git config --global user.name "Your Name"

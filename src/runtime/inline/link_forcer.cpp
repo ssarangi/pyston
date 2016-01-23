@@ -55,8 +55,8 @@ void force() {
     FORCE(unboxInt);
     FORCE(boxFloat);
     FORCE(unboxFloat);
-    FORCE(boxCLFunction);
-    FORCE(unboxCLFunction);
+    FORCE(createFunctionFromMetadata);
+    FORCE(getFunctionMetadata);
     FORCE(boxInstanceMethod);
     FORCE(boxBool);
     FORCE(boxBoolNegated);
@@ -100,6 +100,7 @@ void force() {
     FORCE(yield);
     FORCE(getiterHelper);
     FORCE(hasnext);
+    FORCE(apply_slice);
 
     FORCE(unpackIntoArray);
     FORCE(raiseAttributeError);
@@ -115,8 +116,6 @@ void force() {
     FORCE(printExprHelper);
     FORCE(printHelper);
 
-    FORCE(strOrUnicode);
-    FORCE(printFloat);
     FORCE(listAppendInternal);
     FORCE(getSysStdout);
 

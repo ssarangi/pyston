@@ -1,6 +1,6 @@
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
-set(CMAKE_CXX_FLAGS_DEBUG "-g -DBINARY_SUFFIX= -DBINARY_STRIPPED_SUFFIX=_stripped")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fstrict-aliasing -enable-tbaa -DNVALGRIND -DBINARY_SUFFIX=_release -DBINARY_STRIPPED_SUFFIX=")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -DBINARY_SUFFIX= -DBINARY_STRIPPED_SUFFIX=_stripped -DPy_BUILD_CORE")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fstrict-aliasing -enable-tbaa -DNVALGRIND -DBINARY_SUFFIX=_release -DBINARY_STRIPPED_SUFFIX= -DPy_BUILD_CORE")
 
 execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE GITREV OUTPUT_STRIP_TRAILING_WHITESPACE)
 set_source_files_properties(jit.cpp PROPERTIES COMPILE_DEFINITIONS "GITREV=${GITREV}")
@@ -38,6 +38,7 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		codegen/baseline_jit.cpp
 		codegen/codegen.cpp
 		codegen/compvars.cpp
+        codegen/cpython_ast.cpp
 		codegen/entry.cpp
 		codegen/gcbuilder.cpp
 		codegen/irgen.cpp
@@ -76,7 +77,6 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		gc/gc_alloc.cpp
 		gc/heap.cpp
 		runtime/bool.cpp
-		runtime/builtin_modules/ast.cpp
 		runtime/builtin_modules/builtins.cpp
 		runtime/builtin_modules/gc.cpp
 		runtime/builtin_modules/pyston.cpp

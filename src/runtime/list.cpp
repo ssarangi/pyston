@@ -462,9 +462,7 @@ int list_ass_ext_slice(BoxedList* self, PyObject* item, PyObject* value) {
 
         /* protect against a[::-1] = a */
         if (self == value) {
-            abort();
-            // seq = list_slice((PyListObject*)value, 0,
-            // PyList_GET_SIZE(value));
+            seq = list_slice(value, 0, PyList_GET_SIZE(value));
         } else {
             seq = PySequence_Fast(value, "must assign iterable "
                                          "to extended slice");
@@ -785,6 +783,11 @@ Box* listIAdd(BoxedList* self, Box* _rhs) {
     return self;
 }
 
+Box* listExtend(BoxedList* self, Box* _rhs) {
+    listIAdd(self, _rhs);
+    return None;
+}
+
 Box* listAdd(BoxedList* self, Box* _rhs) {
     if (!PyList_Check(_rhs)) {
         return NotImplemented;
@@ -1021,13 +1024,16 @@ Box* listCount(BoxedList* self, Box* elt) {
     return boxInt(count);
 }
 
-Box* listIndex(BoxedList* self, Box* elt, BoxedInt* _start, Box** args) {
-    BoxedInt* _stop = (BoxedInt*)args[0];
-    RELEASE_ASSERT(!_start || _start->cls == int_cls, "");
-    RELEASE_ASSERT(!_stop || _stop->cls == int_cls, "");
+Box* listIndex(BoxedList* self, Box* elt, Box* _start, Box** args) {
+    Box* _stop = (BoxedInt*)args[0];
 
-    int64_t start = _start ? _start->n : 0;
-    int64_t stop = _stop ? _stop->n : self->size;
+    int64_t start = 0;
+    int64_t stop = self->size;
+
+    if (!_PyEval_SliceIndex(_start, &start))
+        throwCAPIException();
+    if (!_PyEval_SliceIndex(_stop, &stop))
+        throwCAPIException();
 
     if (start < 0) {
         start += self->size;
@@ -1245,6 +1251,22 @@ extern "C" int PyList_SetSlice(PyObject* a, Py_ssize_t ilow, Py_ssize_t ihigh, P
     }
 }
 
+template <ExceptionStyle S> Box* listiterNext(Box* s) noexcept(S == CAPI) {
+    Box* rtn = listiter_next(s);
+    if (!rtn) {
+        if (S == CAPI) {
+            PyErr_SetObject(StopIteration, None);
+            return NULL;
+        } else
+            raiseExcHelper(StopIteration, (const char*)NULL);
+    }
+    return rtn;
+}
+
+// force instantiation:
+template Box* listiterNext<CAPI>(Box*) noexcept;
+template Box* listiterNext<CXX>(Box*);
+
 void BoxedListIterator::gcHandler(GCVisitor* v, Box* b) {
     Box::gcHandler(v, b);
     BoxedListIterator* it = (BoxedListIterator*)b;
@@ -1272,89 +1294,90 @@ void setupList() {
     static PyMappingMethods list_as_mapping;
     list_cls->tp_as_mapping = &list_as_mapping;
 
-    list_cls->tp_iter = listIter;
     list_iterator_cls = BoxedClass::create(type_cls, object_cls, &BoxedListIterator::gcHandler, 0, 0,
                                            sizeof(BoxedListIterator), false, "listiterator");
     list_reverse_iterator_cls = BoxedClass::create(type_cls, object_cls, &BoxedListIterator::gcHandler, 0, 0,
                                                    sizeof(BoxedListIterator), false, "listreverseiterator");
     list_iterator_cls->instances_are_nonzero = list_reverse_iterator_cls->instances_are_nonzero = true;
 
-    list_cls->giveAttr("__len__", new BoxedFunction(boxRTFunction((void*)listLen, BOXED_INT, 1)));
+    list_cls->giveAttr("__len__", new BoxedFunction(FunctionMetadata::create((void*)listLen, BOXED_INT, 1)));
 
-    CLFunction* getitem = createRTFunction(2, false, false);
-    addRTFunction(getitem, (void*)listGetitemInt, UNKNOWN, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT });
-    addRTFunction(getitem, (void*)listGetitemSlice<CXX>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE }, CXX);
-    addRTFunction(getitem, (void*)listGetitem<CXX>, UNKNOWN, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN },
-                  CXX);
-    addRTFunction(getitem, (void*)listGetitemSlice<CAPI>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE },
-                  CAPI);
-    addRTFunction(getitem, (void*)listGetitem<CAPI>, UNKNOWN, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN },
-                  CAPI);
+    FunctionMetadata* getitem = new FunctionMetadata(2, false, false);
+    getitem->addVersion((void*)listGetitemInt, UNKNOWN, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT });
+    getitem->addVersion((void*)listGetitemSlice<CXX>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE }, CXX);
+    getitem->addVersion((void*)listGetitem<CXX>, UNKNOWN, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN }, CXX);
+    getitem->addVersion((void*)listGetitemSlice<CAPI>, LIST, std::vector<ConcreteCompilerType*>{ LIST, SLICE }, CAPI);
+    getitem->addVersion((void*)listGetitem<CAPI>, UNKNOWN, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN },
+                        CAPI);
     list_cls->giveAttr("__getitem__", new BoxedFunction(getitem));
 
-    list_cls->giveAttr("__getslice__", new BoxedFunction(boxRTFunction((void*)listGetslice, LIST, 3)));
+    list_cls->giveAttr("__getslice__", new BoxedFunction(FunctionMetadata::create((void*)listGetslice, LIST, 3)));
 
-    CLFunction* setitem = createRTFunction(3, false, false);
-    addRTFunction(setitem, (void*)listSetitemInt, NONE, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT, UNKNOWN });
-    addRTFunction(setitem, (void*)listSetitemSlice, NONE, std::vector<ConcreteCompilerType*>{ LIST, SLICE, UNKNOWN });
-    addRTFunction(setitem, (void*)listSetitem, NONE, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN, UNKNOWN });
+    FunctionMetadata* setitem = new FunctionMetadata(3, false, false);
+    setitem->addVersion((void*)listSetitemInt, NONE, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT, UNKNOWN });
+    setitem->addVersion((void*)listSetitemSlice, NONE, std::vector<ConcreteCompilerType*>{ LIST, SLICE, UNKNOWN });
+    setitem->addVersion((void*)listSetitem, NONE, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN, UNKNOWN });
     list_cls->giveAttr("__setitem__", new BoxedFunction(setitem));
 
-    list_cls->giveAttr("__setslice__", new BoxedFunction(boxRTFunction((void*)listSetslice, NONE, 4)));
+    list_cls->giveAttr("__setslice__", new BoxedFunction(FunctionMetadata::create((void*)listSetslice, NONE, 4)));
 
-    CLFunction* delitem = createRTFunction(2, false, false);
-    addRTFunction(delitem, (void*)listDelitemInt, NONE, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT });
-    addRTFunction(delitem, (void*)listDelitemSlice, NONE, std::vector<ConcreteCompilerType*>{ LIST, SLICE });
-    addRTFunction(delitem, (void*)listDelitem, NONE, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN });
+    FunctionMetadata* delitem = new FunctionMetadata(2, false, false);
+    delitem->addVersion((void*)listDelitemInt, NONE, std::vector<ConcreteCompilerType*>{ LIST, BOXED_INT });
+    delitem->addVersion((void*)listDelitemSlice, NONE, std::vector<ConcreteCompilerType*>{ LIST, SLICE });
+    delitem->addVersion((void*)listDelitem, NONE, std::vector<ConcreteCompilerType*>{ UNKNOWN, UNKNOWN });
     list_cls->giveAttr("__delitem__", new BoxedFunction(delitem));
 
-    list_cls->giveAttr("__delslice__", new BoxedFunction(boxRTFunction((void*)listDelslice, NONE, 3)));
+    list_cls->giveAttr("__delslice__", new BoxedFunction(FunctionMetadata::create((void*)listDelslice, NONE, 3)));
 
-    list_cls->giveAttr("__iter__",
-                       new BoxedFunction(boxRTFunction((void*)listIter, typeFromClass(list_iterator_cls), 1)));
+    list_cls->giveAttr(
+        "__iter__", new BoxedFunction(FunctionMetadata::create((void*)listIter, typeFromClass(list_iterator_cls), 1)));
 
-    list_cls->giveAttr("__reversed__", new BoxedFunction(boxRTFunction((void*)listReversed,
-                                                                       typeFromClass(list_reverse_iterator_cls), 1)));
+    list_cls->giveAttr("__reversed__", new BoxedFunction(FunctionMetadata::create(
+                                           (void*)listReversed, typeFromClass(list_reverse_iterator_cls), 1)));
 
-    list_cls->giveAttr("__eq__", new BoxedFunction(boxRTFunction((void*)listEq, UNKNOWN, 2)));
-    list_cls->giveAttr("__ne__", new BoxedFunction(boxRTFunction((void*)listNe, UNKNOWN, 2)));
-    list_cls->giveAttr("__lt__", new BoxedFunction(boxRTFunction((void*)listLt, UNKNOWN, 2)));
-    list_cls->giveAttr("__le__", new BoxedFunction(boxRTFunction((void*)listLe, UNKNOWN, 2)));
-    list_cls->giveAttr("__gt__", new BoxedFunction(boxRTFunction((void*)listGt, UNKNOWN, 2)));
-    list_cls->giveAttr("__ge__", new BoxedFunction(boxRTFunction((void*)listGe, UNKNOWN, 2)));
+    list_cls->giveAttr("__eq__", new BoxedFunction(FunctionMetadata::create((void*)listEq, UNKNOWN, 2)));
+    list_cls->giveAttr("__ne__", new BoxedFunction(FunctionMetadata::create((void*)listNe, UNKNOWN, 2)));
+    list_cls->giveAttr("__lt__", new BoxedFunction(FunctionMetadata::create((void*)listLt, UNKNOWN, 2)));
+    list_cls->giveAttr("__le__", new BoxedFunction(FunctionMetadata::create((void*)listLe, UNKNOWN, 2)));
+    list_cls->giveAttr("__gt__", new BoxedFunction(FunctionMetadata::create((void*)listGt, UNKNOWN, 2)));
+    list_cls->giveAttr("__ge__", new BoxedFunction(FunctionMetadata::create((void*)listGe, UNKNOWN, 2)));
 
-    list_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)listRepr, STR, 1)));
-    list_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)listNonzero, BOXED_BOOL, 1)));
+    list_cls->giveAttr("__repr__", new BoxedFunction(FunctionMetadata::create((void*)listRepr, STR, 1)));
+    list_cls->giveAttr("__nonzero__", new BoxedFunction(FunctionMetadata::create((void*)listNonzero, BOXED_BOOL, 1)));
 
-    list_cls->giveAttr("pop", new BoxedFunction(boxRTFunction((void*)listPop, UNKNOWN, 2, false, false), { None }));
+    list_cls->giveAttr("pop",
+                       new BoxedFunction(FunctionMetadata::create((void*)listPop, UNKNOWN, 2, false, false), { None }));
 
-    list_cls->giveAttr("append", new BoxedFunction(boxRTFunction((void*)listAppend, NONE, 2)));
-    list_cls->giveAttr("extend", new BoxedFunction(boxRTFunction((void*)listIAdd, UNKNOWN, 2)));
+    list_cls->giveAttr("append", new BoxedFunction(FunctionMetadata::create((void*)listAppend, NONE, 2)));
+    list_cls->giveAttr("extend", new BoxedFunction(FunctionMetadata::create((void*)listExtend, NONE, 2)));
 
-    list_cls->giveAttr("insert", new BoxedFunction(boxRTFunction((void*)listInsert, NONE, 3)));
-    list_cls->giveAttr("__mul__", new BoxedFunction(boxRTFunction((void*)listMul, UNKNOWN, 2)));
-    list_cls->giveAttr("__rmul__", new BoxedFunction(boxRTFunction((void*)listMul, UNKNOWN, 2)));
-    list_cls->giveAttr("__imul__", new BoxedFunction(boxRTFunction((void*)listImul, UNKNOWN, 2)));
+    list_cls->giveAttr("insert", new BoxedFunction(FunctionMetadata::create((void*)listInsert, NONE, 3)));
+    list_cls->giveAttr("__mul__", new BoxedFunction(FunctionMetadata::create((void*)listMul, UNKNOWN, 2)));
+    list_cls->giveAttr("__rmul__", new BoxedFunction(FunctionMetadata::create((void*)listMul, UNKNOWN, 2)));
+    list_cls->giveAttr("__imul__", new BoxedFunction(FunctionMetadata::create((void*)listImul, UNKNOWN, 2)));
 
-    list_cls->giveAttr("__iadd__", new BoxedFunction(boxRTFunction((void*)listIAdd, UNKNOWN, 2)));
-    list_cls->giveAttr("__add__", new BoxedFunction(boxRTFunction((void*)listAdd, UNKNOWN, 2)));
+    list_cls->giveAttr("__iadd__", new BoxedFunction(FunctionMetadata::create((void*)listIAdd, UNKNOWN, 2)));
+    list_cls->giveAttr("__add__", new BoxedFunction(FunctionMetadata::create((void*)listAdd, UNKNOWN, 2)));
 
-    list_cls->giveAttr("sort", new BoxedFunction(boxRTFunction((void*)listSortFunc, NONE, 4, false, false,
-                                                               ParamNames({ "", "cmp", "key", "reverse" }, "", "")),
-                                                 { None, None, False }));
-    list_cls->giveAttr("__contains__", new BoxedFunction(boxRTFunction((void*)listContains, BOXED_BOOL, 2)));
+    list_cls->giveAttr("sort",
+                       new BoxedFunction(FunctionMetadata::create((void*)listSortFunc, NONE, 4, false, false,
+                                                                  ParamNames({ "", "cmp", "key", "reverse" }, "", "")),
+                                         { None, None, False }));
+    list_cls->giveAttr("__contains__", new BoxedFunction(FunctionMetadata::create((void*)listContains, BOXED_BOOL, 2)));
 
-    list_cls->giveAttr("__init__",
-                       new BoxedFunction(boxRTFunction((void*)listInit, UNKNOWN, 2, false, false), { NULL }));
+    list_cls->giveAttr(
+        "__init__", new BoxedFunction(FunctionMetadata::create((void*)listInit, UNKNOWN, 2, false, false), { NULL }));
 
-    list_cls->giveAttr("count", new BoxedFunction(boxRTFunction((void*)listCount, BOXED_INT, 2)));
-    list_cls->giveAttr("index",
-                       new BoxedFunction(boxRTFunction((void*)listIndex, BOXED_INT, 4, false, false), { NULL, NULL }));
-    list_cls->giveAttr("remove", new BoxedFunction(boxRTFunction((void*)listRemove, NONE, 2)));
-    list_cls->giveAttr("reverse", new BoxedFunction(boxRTFunction((void*)listReverse, NONE, 1)));
+    list_cls->giveAttr("count", new BoxedFunction(FunctionMetadata::create((void*)listCount, BOXED_INT, 2)));
+    list_cls->giveAttr(
+        "index",
+        new BoxedFunction(FunctionMetadata::create((void*)listIndex, BOXED_INT, 4, false, false), { NULL, NULL }));
+    list_cls->giveAttr("remove", new BoxedFunction(FunctionMetadata::create((void*)listRemove, NONE, 2)));
+    list_cls->giveAttr("reverse", new BoxedFunction(FunctionMetadata::create((void*)listReverse, NONE, 1)));
 
     list_cls->giveAttr("__hash__", None);
     list_cls->freeze();
+    list_cls->tp_iter = listIter;
 
     list_cls->tp_as_sequence->sq_length = list_length;
     list_cls->tp_as_sequence->sq_concat = (binaryfunc)list_concat;
@@ -1365,14 +1388,14 @@ void setupList() {
     list_cls->tp_as_sequence->sq_contains = (objobjproc)list_contains;
     list_cls->tp_as_sequence->sq_repeat = (ssizeargfunc)list_repeat;
 
-    CLFunction* hasnext = boxRTFunction((void*)listiterHasnextUnboxed, BOOL, 1);
-    addRTFunction(hasnext, (void*)listiterHasnext, BOXED_BOOL);
+    FunctionMetadata* hasnext = FunctionMetadata::create((void*)listiterHasnextUnboxed, BOOL, 1);
+    hasnext->addVersion((void*)listiterHasnext, BOXED_BOOL);
     list_iterator_cls->giveAttr("__hasnext__", new BoxedFunction(hasnext));
-    list_iterator_cls->giveAttr(
-        "__iter__", new BoxedFunction(boxRTFunction((void*)listIterIter, typeFromClass(list_iterator_cls), 1)));
+    list_iterator_cls->giveAttr("__iter__", new BoxedFunction(FunctionMetadata::create(
+                                                (void*)listIterIter, typeFromClass(list_iterator_cls), 1)));
 
-    CLFunction* listiter_next_func = boxRTFunction((void*)listiterNext<CXX>, UNKNOWN, 1);
-    addRTFunction(listiter_next_func, (void*)listiterNext<CAPI>, UNKNOWN, CAPI);
+    FunctionMetadata* listiter_next_func = FunctionMetadata::create((void*)listiterNext<CXX>, UNKNOWN, 1);
+    listiter_next_func->addVersion((void*)listiterNext<CAPI>, UNKNOWN, CAPI);
     list_iterator_cls->giveAttr("next", new BoxedFunction(listiter_next_func));
 
     list_iterator_cls->freeze();
@@ -1382,12 +1405,14 @@ void setupList() {
 
     list_reverse_iterator_cls->giveAttr("__name__", boxString("listreverseiterator"));
 
-    hasnext = boxRTFunction((void*)listreviterHasnextUnboxed, BOOL, 1);
-    addRTFunction(hasnext, (void*)listreviterHasnext, BOXED_BOOL);
+    hasnext = FunctionMetadata::create((void*)listreviterHasnextUnboxed, BOOL, 1);
+    hasnext->addVersion((void*)listreviterHasnext, BOXED_BOOL);
     list_reverse_iterator_cls->giveAttr("__hasnext__", new BoxedFunction(hasnext));
     list_reverse_iterator_cls->giveAttr(
-        "__iter__", new BoxedFunction(boxRTFunction((void*)listIterIter, typeFromClass(list_reverse_iterator_cls), 1)));
-    list_reverse_iterator_cls->giveAttr("next", new BoxedFunction(boxRTFunction((void*)listreviterNext, UNKNOWN, 1)));
+        "__iter__",
+        new BoxedFunction(FunctionMetadata::create((void*)listIterIter, typeFromClass(list_reverse_iterator_cls), 1)));
+    list_reverse_iterator_cls->giveAttr(
+        "next", new BoxedFunction(FunctionMetadata::create((void*)listreviterNext, UNKNOWN, 1)));
 
     list_reverse_iterator_cls->freeze();
     list_reverse_iterator_cls->tp_iternext = listreviter_next;

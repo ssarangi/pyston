@@ -41,6 +41,7 @@ BoxedDict* sys_modules_dict;
 extern "C" {
 // supposed to be exposed through sys.flags
 int Py_BytesWarningFlag = 0;
+int Py_DivisionWarningFlag = 0;
 int Py_HashRandomizationFlag = 0;
 }
 
@@ -151,6 +152,16 @@ extern "C" PyObject* PySys_GetObject(const char* name) noexcept {
     return sys_module->getattr(internStringMortal(name));
 }
 
+extern "C" FILE* PySys_GetFile(char* name, FILE* def) noexcept {
+    FILE* fp = NULL;
+    PyObject* v = PySys_GetObject(name);
+    if (v != NULL && PyFile_Check(v))
+        fp = PyFile_AsFile(v);
+    if (fp == NULL)
+        fp = def;
+    return fp;
+}
+
 static void mywrite(const char* name, FILE* fp, const char* format, va_list va) noexcept {
     PyObject* file;
     PyObject* error_type, *error_value, *error_traceback;
@@ -246,9 +257,9 @@ public:
 
 static std::string generateVersionString() {
     std::ostringstream oss;
-    oss << PYTHON_VERSION_MAJOR << '.' << PYTHON_VERSION_MINOR << '.' << PYTHON_VERSION_MICRO;
+    oss << PY_MAJOR_VERSION << '.' << PY_MINOR_VERSION << '.' << PY_MICRO_VERSION;
     oss << '\n';
-    oss << "[Pyston " << PYSTON_VERSION_MAJOR << '.' << PYSTON_VERSION_MINOR << "]";
+    oss << "[Pyston " << PYSTON_VERSION_MAJOR << '.' << PYSTON_VERSION_MINOR << '.' << PYSTON_VERSION_MICRO << "]";
     return oss.str();
 }
 
@@ -388,6 +399,10 @@ extern "C" const char* Py_GetPlatform() noexcept {
     // build-time.
     return "unknown";
 #endif
+}
+
+extern "C" PyObject* PySys_GetModulesDict() noexcept {
+    return getSysModulesDict();
 }
 
 static PyObject* sys_excepthook(PyObject* self, PyObject* args) noexcept {
@@ -580,6 +595,43 @@ PyObject* PyFloat_GetInfo(void) {
     return floatinfo;
 }
 
+PyDoc_STRVAR(exc_info_doc, "exc_info() -> (type, value, traceback)\n\
+\n\
+Return information about the most recent exception caught by an except\n\
+clause in the current stack frame or in an older stack frame.");
+
+PyDoc_STRVAR(exc_clear_doc, "exc_clear() -> None\n\
+\n\
+Clear global information on the current exception.  Subsequent calls to\n\
+exc_info() will return (None,None,None) until another exception is raised\n\
+in the current thread or the execution stack returns to a frame where\n\
+another exception is being handled.");
+
+
+PyDoc_STRVAR(exit_doc, "exit([status])\n\
+\n\
+Exit the interpreter by raising SystemExit(status).\n\
+If the status is omitted or None, it defaults to zero (i.e., success).\n\
+If the status is an integer, it will be used as the system exit status.\n\
+If it is another kind of object, it will be printed and the system\n\
+exit status will be one (i.e., failure).");
+
+PyDoc_STRVAR(getdefaultencoding_doc, "getdefaultencoding() -> string\n\
+\n\
+Return the current default string encoding used by the Unicode \n\
+implementation.");
+
+PyDoc_STRVAR(getfilesystemencoding_doc, "getfilesystemencoding() -> string\n\
+\n\
+Return the encoding used to convert Unicode filenames in\n\
+operating system filenames.");
+
+PyDoc_STRVAR(getrecursionlimit_doc, "getrecursionlimit()\n\
+\n\
+Return the current value of the recursion limit, the maximum depth\n\
+of the Python interpreter stack.  This limit prevents infinite\n\
+recursion from causing an overflow of the C stack and crashing Python.");
+
 void setupSys() {
     sys_modules_dict = new BoxedDict();
     gc::registerPermanentRoot(sys_modules_dict);
@@ -601,12 +653,15 @@ void setupSys() {
     sys_module->giveAttr("__stdin__", sys_module->getattr(internStringMortal("stdin")));
     sys_module->giveAttr("__stderr__", sys_module->getattr(internStringMortal("stderr")));
 
-    sys_module->giveAttr(
-        "exc_info", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysExcInfo, BOXED_TUPLE, 0), "exc_info"));
+    sys_module->giveAttr("exc_info",
+                         new BoxedBuiltinFunctionOrMethod(FunctionMetadata::create((void*)sysExcInfo, BOXED_TUPLE, 0),
+                                                          "exc_info", exc_info_doc));
     sys_module->giveAttr("exc_clear",
-                         new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysExcClear, NONE, 0), "exc_clear"));
-    sys_module->giveAttr("exit", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysExit, NONE, 1, false, false),
-                                                                  "exit", { None }));
+                         new BoxedBuiltinFunctionOrMethod(FunctionMetadata::create((void*)sysExcClear, NONE, 0),
+                                                          "exc_clear", exc_clear_doc));
+    sys_module->giveAttr(
+        "exit", new BoxedBuiltinFunctionOrMethod(FunctionMetadata::create((void*)sysExit, NONE, 1, false, false),
+                                                 "exit", { None }, NULL, exit_doc));
 
     sys_module->giveAttr("warnoptions", new BoxedList());
     sys_module->giveAttr("py3kwarning", False);
@@ -616,19 +671,20 @@ void setupSys() {
 
     sys_module->giveAttr("executable", boxString(Py_GetProgramFullPath()));
 
-    sys_module->giveAttr("_getframe",
-                         new BoxedFunction(boxRTFunction((void*)sysGetFrame, UNKNOWN, 1, false, false), { NULL }));
     sys_module->giveAttr(
-        "getdefaultencoding",
-        new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysGetDefaultEncoding, STR, 0), "getdefaultencoding"));
+        "_getframe",
+        new BoxedFunction(FunctionMetadata::create((void*)sysGetFrame, UNKNOWN, 1, false, false), { NULL }));
+    sys_module->giveAttr("getdefaultencoding", new BoxedBuiltinFunctionOrMethod(
+                                                   FunctionMetadata::create((void*)sysGetDefaultEncoding, STR, 0),
+                                                   "getdefaultencoding", getdefaultencoding_doc));
 
-    sys_module->giveAttr("getfilesystemencoding",
-                         new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysGetFilesystemEncoding, STR, 0),
-                                                          "getfilesystemencoding"));
+    sys_module->giveAttr("getfilesystemencoding", new BoxedBuiltinFunctionOrMethod(
+                                                      FunctionMetadata::create((void*)sysGetFilesystemEncoding, STR, 0),
+                                                      "getfilesystemencoding", getfilesystemencoding_doc));
 
-    sys_module->giveAttr(
-        "getrecursionlimit",
-        new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysGetRecursionLimit, UNKNOWN, 0), "getrecursionlimit"));
+    sys_module->giveAttr("getrecursionlimit", new BoxedBuiltinFunctionOrMethod(
+                                                  FunctionMetadata::create((void*)sysGetRecursionLimit, UNKNOWN, 0),
+                                                  "getrecursionlimit", getrecursionlimit_doc));
 
     sys_module->giveAttr("meta_path", new BoxedList());
     sys_module->giveAttr("path_hooks", new BoxedList());
@@ -655,8 +711,8 @@ void setupSys() {
 
     sys_flags_cls = new (0)
         BoxedClass(object_cls, BoxedSysFlags::gcHandler, 0, 0, sizeof(BoxedSysFlags), false, "flags");
-    sys_flags_cls->giveAttr("__new__",
-                            new BoxedFunction(boxRTFunction((void*)BoxedSysFlags::__new__, UNKNOWN, 1, true, true)));
+    sys_flags_cls->giveAttr(
+        "__new__", new BoxedFunction(FunctionMetadata::create((void*)BoxedSysFlags::__new__, UNKNOWN, 1, true, true)));
 #define ADD(name)                                                                                                      \
     sys_flags_cls->giveAttr(STRINGIFY(name),                                                                           \
                             new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedSysFlags, name)))
@@ -670,6 +726,14 @@ void setupSys() {
 #ifdef Py_USING_UNICODE
     SET_SYS_FROM_STRING("maxunicode", PyInt_FromLong(PyUnicode_GetMax()));
 #endif
+
+/* float repr style: 0.03 (short) vs 0.029999999999999999 (legacy) */
+#ifndef PY_NO_SHORT_FLOAT_REPR
+    SET_SYS_FROM_STRING("float_repr_style", PyString_FromString("short"));
+#else
+    SET_SYS_FROM_STRING("float_repr_style", PyString_FromString("legacy"));
+#endif
+
     sys_flags_cls->tp_mro = BoxedTuple::create({ sys_flags_cls, object_cls });
     sys_flags_cls->freeze();
 

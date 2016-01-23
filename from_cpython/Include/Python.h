@@ -41,9 +41,6 @@
 
 #include <assert.h>
 
-// CPython doesn't seem to include this but I'm not sure how they get the definition of 'bool':
-#include <stdbool.h>
-
 #include "pyport.h"
 
 #include "pymath.h"
@@ -77,6 +74,7 @@
 #include "classobject.h"
 #include "cobject.h"
 #include "fileobject.h"
+#include "frameobject.h"
 #include "pycapsule.h"
 #include "traceback.h"
 #include "sliceobject.h"
@@ -133,8 +131,11 @@ PyAPI_FUNC(void) PyType_SetDict(PyTypeObject*, PyObject*) PYSTON_NOEXCEPT;
 
 #include "abstract.h"
 
+#include "compile.h"
+
 #include "pyctype.h"
 #include "pystrtod.h"
+#include "pystrcmp.h"
 #include "dtoa.h"
 
 // directly from CPython:
@@ -173,6 +174,7 @@ PyObject* PyGC_AddRoot(PyObject*) PYSTON_NOEXCEPT;
 // a temporary patching mechanism - we want to have a better way of dealing with such objects
 // in the future (even if it's an invalid use of CPython APIs).
 PyObject* PyGC_AddNonHeapRoot(PyObject* obj, int size) PYSTON_NOEXCEPT;
+void* PyGC_AddPotentialRoot(void* obj, int size) PYSTON_NOEXCEPT;
 
 // Pyston change : expose these type objects
 extern PyTypeObject Pattern_Type;
@@ -184,9 +186,6 @@ extern PyTypeObject* Itertool_SafeDealloc_Types[];
 #define PyDoc_VAR(name) static char name[]
 #define PyDoc_STRVAR(name, str) PyDoc_VAR(name) = PyDoc_STR(str)
 #define PyDoc_STR(str) str
-
-// This is in Python-ast.h in CPython, which we don't yet have:
-int PyAST_Check(PyObject* obj) PYSTON_NOEXCEPT;
 
 #ifdef __cplusplus
 #define PyMODINIT_FUNC extern "C" void

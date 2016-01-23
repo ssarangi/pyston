@@ -36,6 +36,7 @@
 #include "codegen/irgen/hooks.h"
 #include "codegen/irgen/irgenerator.h"
 #include "codegen/stackmaps.h"
+#include "core/cfg.h"
 #include "core/util.h"
 #include "runtime/ctxswitching.h"
 #include "runtime/objmodel.h"
@@ -278,7 +279,7 @@ struct PythonFrameId {
 class PythonFrameIteratorImpl {
 public:
     PythonFrameId id;
-    CLFunction* cl; // always exists
+    FunctionMetadata* md; // always exists
 
     // These only exist if id.type==COMPILED:
     CompiledFunction* cf;
@@ -289,10 +290,10 @@ public:
 
     PythonFrameIteratorImpl() : regs_valid(0) {}
 
-    PythonFrameIteratorImpl(PythonFrameId::FrameType type, uint64_t ip, uint64_t bp, CLFunction* cl,
+    PythonFrameIteratorImpl(PythonFrameId::FrameType type, uint64_t ip, uint64_t bp, FunctionMetadata* md,
                             CompiledFunction* cf)
-        : id(PythonFrameId(type, ip, bp)), cl(cl), cf(cf), regs_valid(0) {
-        assert(cl);
+        : id(PythonFrameId(type, ip, bp)), md(md), cf(cf), regs_valid(0) {
+        assert(md);
         assert((type == PythonFrameId::COMPILED) == (cf != NULL));
     }
 
@@ -301,9 +302,9 @@ public:
         return cf;
     }
 
-    CLFunction* getCL() const {
-        assert(cl);
-        return cl;
+    FunctionMetadata* getMD() const {
+        assert(md);
+        return md;
     }
 
     uint64_t readLocation(const StackMap::Record::Location& loc) {
@@ -343,7 +344,6 @@ public:
 
         assert(cf->location_map);
         const LocationMap::LocationTable& table = cf->location_map->names[name];
-        assert(table.locations.size());
 
         auto entry = table.findEntry(offset);
         if (!entry)
@@ -355,28 +355,17 @@ public:
     AST_stmt* getCurrentStatement() {
         if (id.type == PythonFrameId::COMPILED) {
             auto locations = findLocations("!current_stmt");
-            RELEASE_ASSERT(locations.size() == 1, "%ld", locations.size());
-            return reinterpret_cast<AST_stmt*>(readLocation(locations[0]));
-        } else if (id.type == PythonFrameId::INTERPRETED) {
-            return getCurrentStatementForInterpretedFrame((void*)id.bp);
+            if (locations.size() == 1)
+                return reinterpret_cast<AST_stmt*>(readLocation(locations[0]));
         }
-        abort();
+        assert(getFrameInfo()->stmt);
+        return getFrameInfo()->stmt;
     }
 
     Box* getGlobals() {
-        if (id.type == PythonFrameId::COMPILED) {
-            CompiledFunction* cf = getCF();
-            if (cf->clfunc->source->scoping->areGlobalsFromModule())
-                return cf->clfunc->source->parent_module;
-            auto locations = findLocations(PASSED_GLOBALS_NAME);
-            assert(locations.size() == 1);
-            Box* r = (Box*)readLocation(locations[0]);
-            ASSERT(gc::isValidGCObject(r), "%p", r);
-            return r;
-        } else if (id.type == PythonFrameId::INTERPRETED) {
-            return getGlobalsForInterpretedFrame((void*)id.bp);
-        }
-        abort();
+        Box* r = getFrameInfo()->globals;
+        ASSERT(gc::isValidGCObject(r), "%p", r);
+        return r;
     }
 
     Box* getGlobalsDict() {
@@ -394,8 +383,7 @@ public:
             CompiledFunction* cf = getCF();
             assert(cf->location_map->frameInfoFound());
             const auto& frame_info_loc = cf->location_map->frame_info_location;
-
-            return reinterpret_cast<FrameInfo*>(readLocation(frame_info_loc));
+            return *reinterpret_cast<FrameInfo**>(readLocation(frame_info_loc));
         } else if (id.type == PythonFrameId::INTERPRETED) {
             return getFrameInfoForInterpretedFrame((void*)id.bp);
         }
@@ -461,16 +449,16 @@ static inline unw_word_t get_cursor_bp(unw_cursor_t* cursor) {
 // frame information through the PythonFrameIteratorImpl* info arg.
 bool frameIsPythonFrame(unw_word_t ip, unw_word_t bp, unw_cursor_t* cursor, PythonFrameIteratorImpl* info) {
     CompiledFunction* cf = getCFForAddress(ip);
-    CLFunction* cl = cf ? cf->clfunc : NULL;
+    FunctionMetadata* md = cf ? cf->md : NULL;
     bool jitted = cf != NULL;
     bool interpreted = !jitted && inASTInterpreterExecuteInner(ip);
     if (interpreted)
-        cl = getCLForInterpretedFrame((void*)bp);
+        md = getMDForInterpretedFrame((void*)bp);
 
     if (!jitted && !interpreted)
         return false;
 
-    *info = PythonFrameIteratorImpl(jitted ? PythonFrameId::COMPILED : PythonFrameId::INTERPRETED, ip, bp, cl, cf);
+    *info = PythonFrameIteratorImpl(jitted ? PythonFrameId::COMPILED : PythonFrameId::INTERPRETED, ip, bp, md, cf);
     if (jitted) {
         // Try getting all the callee-save registers, and save the ones we were able to get.
         // Some of them may be inaccessible, I think because they weren't defined by that
@@ -493,10 +481,10 @@ bool frameIsPythonFrame(unw_word_t ip, unw_word_t bp, unw_cursor_t* cursor, Pyth
 
 static const LineInfo lineInfoForFrame(PythonFrameIteratorImpl* frame_it) {
     AST_stmt* current_stmt = frame_it->getCurrentStatement();
-    auto* cl = frame_it->getCL();
-    assert(cl);
+    auto* md = frame_it->getMD();
+    assert(md);
 
-    auto source = cl->source.get();
+    auto source = md->source.get();
 
     return LineInfo(current_stmt->lineno, current_stmt->col_offset, source->getFn(), source->getName());
 }
@@ -547,6 +535,7 @@ public:
 
     void begin() {
         exc_info = ExcInfo(NULL, NULL, NULL);
+        pystack_extractor = PythonStackExtractor(); // resets skip_next_pythonlike_frame
         t.restart();
 
         static StatCounter stat("unwind_sessions");
@@ -558,13 +547,10 @@ public:
     }
 
     void handleCFrame(unw_cursor_t* cursor) {
-        unw_word_t ip = get_cursor_ip(cursor);
-        unw_word_t bp = get_cursor_bp(cursor);
-
         PythonFrameIteratorImpl frame_iter;
         bool found_frame = pystack_extractor.handleCFrame(cursor, &frame_iter);
         if (found_frame) {
-            frame_iter.getCL()->propagated_cxx_exceptions++;
+            frame_iter.getMD()->propagated_cxx_exceptions++;
 
             if (exceptionAtLineCheck()) {
                 // TODO: shouldn't fetch this multiple times?
@@ -797,11 +783,11 @@ void updateFrameExcInfoIfNeeded(ExcInfo* latest) {
     return;
 }
 
-CLFunction* getTopPythonFunction() {
+FunctionMetadata* getTopPythonFunction() {
     auto rtn = getTopPythonFrame();
     if (!rtn)
         return NULL;
-    return getTopPythonFrame()->getCL();
+    return getTopPythonFrame()->getMD();
 }
 
 Box* getGlobals() {
@@ -816,10 +802,10 @@ Box* getGlobalsDict() {
 }
 
 BoxedModule* getCurrentModule() {
-    CLFunction* clfunc = getTopPythonFunction();
-    if (!clfunc)
+    FunctionMetadata* md = getTopPythonFunction();
+    if (!md)
         return NULL;
-    return clfunc->source->parent_module;
+    return md->source->parent_module;
 }
 
 PythonFrameIterator getPythonFrame(int depth) {
@@ -849,9 +835,6 @@ void PythonFrameIterator::operator=(PythonFrameIterator&& rhs) {
 PythonFrameIterator::PythonFrameIterator(std::unique_ptr<PythonFrameIteratorImpl> impl) {
     std::swap(this->impl, impl);
 }
-
-// TODO factor getDeoptState and fastLocalsToBoxedLocals
-// because they are pretty ugly but have a pretty repetitive pattern.
 
 DeoptState getDeoptState() {
     DeoptState rtn;
@@ -889,6 +872,24 @@ DeoptState getDeoptState() {
                     if ((v & 1) == 0)
                         is_undefined.insert(p.first().substr(12));
                 }
+            }
+
+            // We could do much better here by memcpying the user visible vregs into the new location which the
+            // interpreter allocated, instead of storing them one by one in a dict and then retrieving them
+            // and assigning them to the new vregs array...
+            // But deopts are so rare it's not really worth it.
+            Box** vregs = frame_iter->getFrameInfo()->vregs;
+            for (const auto& p : cf->md->source->cfg->sym_vreg_map_user_visible) {
+                if (is_undefined.count(p.first.s()))
+                    continue;
+                assert(p.second >= 0 && p.second < cf->md->source->cfg->sym_vreg_map_user_visible.size());
+
+                Box* v = vregs[p.second];
+                if (!v)
+                    continue;
+
+                ASSERT(gc::isValidGCObject(v), "%p", v);
+                d->d[p.first.getBox()] = v;
             }
 
             for (const auto& p : cf->location_map->names) {
@@ -937,106 +938,25 @@ Box* fastLocalsToBoxedLocals() {
 Box* PythonFrameIterator::fastLocalsToBoxedLocals() {
     assert(impl.get());
 
-    BoxedDict* d;
-    BoxedClosure* closure;
-    FrameInfo* frame_info;
-
-    CLFunction* clfunc = impl->getCL();
-    ScopeInfo* scope_info = clfunc->source->getScopeInfo();
+    FunctionMetadata* md = impl->getMD();
+    ScopeInfo* scope_info = md->source->getScopeInfo();
 
     if (scope_info->areLocalsFromModule()) {
         // TODO we should cache this in frame_info->locals or something so that locals()
         // (and globals() too) will always return the same dict
-        RELEASE_ASSERT(clfunc->source->scoping->areGlobalsFromModule(), "");
-        return clfunc->source->parent_module->getAttrWrapper();
+        RELEASE_ASSERT(md->source->scoping->areGlobalsFromModule(), "");
+        return md->source->parent_module->getAttrWrapper();
     }
 
+    BoxedDict* d;
+    FrameInfo* frame_info = impl->getFrameInfo();
+    BoxedClosure* closure = frame_info->passed_closure;
     if (impl->getId().type == PythonFrameId::COMPILED) {
         CompiledFunction* cf = impl->getCF();
-        d = new BoxedDict();
-
-        uint64_t ip = impl->getId().ip;
-
-        assert(ip > cf->code_start);
-        unsigned offset = ip - cf->code_start;
-
-        assert(cf->location_map);
-
-        // We have to detect + ignore any entries for variables that
-        // could have been defined (so they have entries) but aren't (so the
-        // entries point to uninitialized memory).
-        std::unordered_set<std::string> is_undefined;
-
-        for (const auto& p : cf->location_map->names) {
-            if (!startswith(p.first(), "!is_defined_"))
-                continue;
-
-            auto e = p.second.findEntry(offset);
-            if (e) {
-                const auto& locs = e->locations;
-
-                assert(locs.size() == 1);
-                uint64_t v = impl->readLocation(locs[0]);
-                if ((v & 1) == 0)
-                    is_undefined.insert(p.first().substr(12));
-            }
-        }
-
-        for (const auto& p : cf->location_map->names) {
-            if (p.first()[0] == '!')
-                continue;
-
-            if (p.first()[0] == '#')
-                continue;
-
-            if (is_undefined.count(p.first()))
-                continue;
-
-            auto e = p.second.findEntry(offset);
-            if (e) {
-                const auto& locs = e->locations;
-
-                llvm::SmallVector<uint64_t, 1> vals;
-                // printf("%s: %s\n", p.first().c_str(), e.type->debugName().c_str());
-                // printf("%ld locs\n", locs.size());
-
-                for (auto& loc : locs) {
-                    auto v = impl->readLocation(loc);
-                    vals.push_back(v);
-                    // printf("%d %d %d: 0x%lx\n", loc.type, loc.regnum, loc.offset, v);
-                    // dump((void*)v);
-                }
-
-                Box* v = e->type->deserializeFromFrame(vals);
-                // printf("%s: (pp id %ld) %p\n", p.first().c_str(), e._debug_pp_id, v);
-                assert(gc::isValidGCObject(v));
-                d->d[boxString(p.first())] = v;
-            }
-        }
-
-        closure = NULL;
-        if (cf->location_map->names.count(PASSED_CLOSURE_NAME) > 0) {
-            auto e = cf->location_map->names[PASSED_CLOSURE_NAME].findEntry(offset);
-            if (e) {
-                const auto& locs = e->locations;
-
-                llvm::SmallVector<uint64_t, 1> vals;
-
-                for (auto& loc : locs) {
-                    vals.push_back(impl->readLocation(loc));
-                }
-
-                Box* v = e->type->deserializeFromFrame(vals);
-                assert(gc::isValidGCObject(v));
-                closure = static_cast<BoxedClosure*>(v);
-            }
-        }
-
-        frame_info = impl->getFrameInfo();
+        assert(impl->getId().ip > cf->code_start);
+        d = localsForInterpretedFrame(frame_info->vregs, cf->md->source->cfg);
     } else if (impl->getId().type == PythonFrameId::INTERPRETED) {
-        d = localsForInterpretedFrame((void*)impl->getId().bp, true);
-        closure = passedClosureForInterpretedFrame((void*)impl->getId().bp);
-        frame_info = getFrameInfoForInterpretedFrame((void*)impl->getId().bp);
+        d = localsForInterpretedFrame((void*)impl->getId().bp);
     } else {
         abort();
     }
@@ -1071,10 +991,17 @@ Box* PythonFrameIterator::fastLocalsToBoxedLocals() {
     // TODO Right now d just has all the python variables that are *initialized*
     // But we also need to loop through all the uninitialized variables that we have
     // access to and delete them from the locals dict
-    for (const auto& p : *d) {
-        Box* varname = p.first;
-        Box* value = p.second;
-        setitem(frame_info->boxedLocals, varname, value);
+    if (frame_info->boxedLocals->cls == dict_cls) {
+        BoxedDict* boxed_locals = (BoxedDict*)frame_info->boxedLocals;
+        for (auto&& new_elem : d->d) {
+            boxed_locals->d[new_elem.first] = new_elem.second;
+        }
+    } else {
+        for (const auto& p : *d) {
+            Box* varname = p.first;
+            Box* value = p.second;
+            setitem(frame_info->boxedLocals, varname, value);
+        }
     }
 
     return frame_info->boxedLocals;
@@ -1088,8 +1015,8 @@ CompiledFunction* PythonFrameIterator::getCF() {
     return impl->getCF();
 }
 
-CLFunction* PythonFrameIterator::getCL() {
-    return impl->getCL();
+FunctionMetadata* PythonFrameIterator::getMD() {
+    return impl->getMD();
 }
 
 Box* PythonFrameIterator::getGlobalsDict() {
@@ -1142,8 +1069,8 @@ std::string getCurrentPythonLine() {
     if (frame_iter.get()) {
         std::ostringstream stream;
 
-        auto* clfunc = frame_iter->getCL();
-        auto source = clfunc->source.get();
+        auto* md = frame_iter->getMD();
+        auto source = md->source.get();
 
         auto current_stmt = frame_iter->getCurrentStatement();
 

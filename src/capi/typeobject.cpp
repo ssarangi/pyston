@@ -632,22 +632,33 @@ extern "C" int _PyObject_SlotCompare(PyObject* self, PyObject* other) noexcept {
 static PyObject* slot_tp_repr(PyObject* self) noexcept {
     STAT_TIMER(t0, "us_timer_slot_tprepr", SLOT_AVOIDABILITY(self));
 
-    try {
-        return repr(self);
-    } catch (ExcInfo e) {
-        setCAPIException(e);
-        return NULL;
+    PyObject* func, *res;
+    static PyObject* repr_str;
+
+    func = lookup_method(self, "__repr__", &repr_str);
+    if (func != NULL) {
+        res = PyEval_CallObject(func, NULL);
+        Py_DECREF(func);
+        return res;
     }
+    PyErr_Clear();
+    return PyString_FromFormat("<%s object at %p>", Py_TYPE(self)->tp_name, self);
 }
 
 static PyObject* slot_tp_str(PyObject* self) noexcept {
     STAT_TIMER(t0, "us_timer_slot_tpstr", SLOT_AVOIDABILITY(self));
 
-    try {
-        return str(self);
-    } catch (ExcInfo e) {
-        setCAPIException(e);
-        return NULL;
+    PyObject* func, *res;
+    static PyObject* str_str;
+
+    func = lookup_method(self, "__str__", &str_str);
+    if (func != NULL) {
+        res = PyEval_CallObject(func, NULL);
+        Py_DECREF(func);
+        return res;
+    } else {
+        PyErr_Clear();
+        return slot_tp_repr(self);
     }
 }
 
@@ -793,10 +804,9 @@ PyObject* slot_tp_iter(PyObject* self) noexcept {
     return call_method(self, "next", &next_str, "()");
 }
 
-static bool slotTppHasnext(PyObject* self) {
+static llvm_compat_bool slotTppHasnext(PyObject* self) {
     STAT_TIMER(t0, "us_timer_slot_tpphasnext", SLOT_AVOIDABILITY(self));
 
-    static PyObject* hasnext_str;
     Box* r = self->hasnextOrNullIC();
     assert(r);
     return r->nonzeroIC();
@@ -883,11 +893,12 @@ static PyObject* call_attribute(PyObject* self, PyObject* attr, PyObject* name) 
 
 /* Pyston change: static */ PyObject* slot_tp_getattr_hook(PyObject* self, PyObject* name) noexcept {
     assert(name->cls == str_cls);
-    return slotTpGetattrHookInternal<CAPI, NOT_REWRITABLE>(self, (BoxedString*)name, NULL);
+    return slotTpGetattrHookInternal<CAPI, NOT_REWRITABLE>(self, (BoxedString*)name, NULL, false, NULL, NULL);
 }
 
 template <ExceptionStyle S, Rewritable rewritable>
-Box* slotTpGetattrHookInternal(Box* self, BoxedString* name, GetattrRewriteArgs* rewrite_args) noexcept(S == CAPI) {
+Box* slotTpGetattrHookInternal(Box* self, BoxedString* name, GetattrRewriteArgs* rewrite_args, bool for_call,
+                               Box** bind_obj_out, RewriterVar** r_bind_obj_out) noexcept(S == CAPI) {
     if (rewritable == NOT_REWRITABLE) {
         assert(!rewrite_args);
         rewrite_args = NULL;
@@ -971,7 +982,8 @@ Box* slotTpGetattrHookInternal(Box* self, BoxedString* name, GetattrRewriteArgs*
             GetattrRewriteArgs grewrite_args(rewrite_args->rewriter, rewrite_args->obj, rewrite_args->destination);
             try {
                 assert(!PyType_Check(self)); // There would be a getattribute
-                res = getattrInternalGeneric<false, rewritable>(self, name, &grewrite_args, false, false, NULL, NULL);
+                res = getattrInternalGeneric<false, rewritable>(self, name, &grewrite_args, false, for_call,
+                                                                bind_obj_out, r_bind_obj_out);
             } catch (ExcInfo e) {
                 if (!e.matches(AttributeError)) {
                     if (S == CAPI) {
@@ -1001,24 +1013,26 @@ Box* slotTpGetattrHookInternal(Box* self, BoxedString* name, GetattrRewriteArgs*
                     return res;
                 } else if (return_convention == ReturnConvention::NO_RETURN) {
                     assert(!res);
-                } else if (return_convention == ReturnConvention::CAPI_RETURN) {
+                } else if (return_convention == ReturnConvention::CAPI_RETURN
+                           || return_convention == ReturnConvention::NOEXC_POSSIBLE) {
                     // If we get a CAPI return, we probably did a function call, and these guards
                     // will probably just make the rewrite fail:
                     if (res) {
                         rtn->addGuardNotEq(0);
                         rewrite_args->setReturn(rtn, ReturnConvention::HAS_RETURN);
                         return res;
-                    } else
-                        rtn->addGuard(0);
+                    } else {
+                        // this could set a CAPI exception and we won't clear it inside the rewrite.
+                        rewrite_args = 0;
+                    }
                 } else {
-                    assert(return_convention == ReturnConvention::NOEXC_POSSIBLE);
-                    rewrite_args = NULL;
+                    RELEASE_ASSERT(0, "");
                 }
             }
         } else {
             try {
                 assert(!PyType_Check(self)); // There would be a getattribute
-                res = getattrInternalGeneric<false, rewritable>(self, name, NULL, false, false, NULL, NULL);
+                res = getattrInternalGeneric<false, NOT_REWRITABLE>(self, name, NULL, false, false, NULL, NULL);
             } catch (ExcInfo e) {
                 if (!e.matches(AttributeError)) {
                     if (S == CAPI) {
@@ -1097,13 +1111,17 @@ Box* slotTpGetattrHookInternal(Box* self, BoxedString* name, GetattrRewriteArgs*
 }
 // Force instantiation of the template
 template Box* slotTpGetattrHookInternal<CAPI, REWRITABLE>(Box* self, BoxedString* name,
-                                                          GetattrRewriteArgs* rewrite_args);
-template Box* slotTpGetattrHookInternal<CXX, REWRITABLE>(Box* self, BoxedString* name,
-                                                         GetattrRewriteArgs* rewrite_args);
+                                                          GetattrRewriteArgs* rewrite_args, bool for_call,
+                                                          Box** bind_obj_out, RewriterVar** r_bind_obj_out);
+template Box* slotTpGetattrHookInternal<CXX, REWRITABLE>(Box* self, BoxedString* name, GetattrRewriteArgs* rewrite_args,
+                                                         bool for_call, Box** bind_obj_out,
+                                                         RewriterVar** r_bind_obj_out);
 template Box* slotTpGetattrHookInternal<CAPI, NOT_REWRITABLE>(Box* self, BoxedString* name,
-                                                              GetattrRewriteArgs* rewrite_args);
+                                                              GetattrRewriteArgs* rewrite_args, bool for_call,
+                                                              Box** bind_obj_out, RewriterVar** r_bind_obj_out);
 template Box* slotTpGetattrHookInternal<CXX, NOT_REWRITABLE>(Box* self, BoxedString* name,
-                                                             GetattrRewriteArgs* rewrite_args);
+                                                             GetattrRewriteArgs* rewrite_args, bool for_call,
+                                                             Box** bind_obj_out, RewriterVar** r_bind_obj_out);
 
 /* Pyston change: static */ PyObject* slot_tp_new(PyTypeObject* self, PyObject* args, PyObject* kwds) noexcept {
     STAT_TIMER(t0, "us_timer_slot_tpnew", SLOT_AVOIDABILITY(self));
@@ -1896,8 +1914,8 @@ static const slotdef* update_one_slot(BoxedClass* type, const slotdef* p) noexce
                sanity checks.  I'll buy the first person to
                point out a bug in this reasoning a beer. */
         } else if (offset == offsetof(BoxedClass, tp_descr_get) && descr->cls == function_cls
-                   && static_cast<BoxedFunction*>(descr)->f->always_use_version) {
-            CompiledFunction* cf = static_cast<BoxedFunction*>(descr)->f->always_use_version;
+                   && static_cast<BoxedFunction*>(descr)->md->always_use_version) {
+            CompiledFunction* cf = static_cast<BoxedFunction*>(descr)->md->always_use_version;
             if (cf->exception_style == CXX) {
                 type->tpp_descr_get = (descrgetfunc)cf->code;
                 specific = (void*)slot_tp_tpp_descr_get;
@@ -3301,7 +3319,24 @@ void commonClassSetup(BoxedClass* cls) {
 }
 
 extern "C" void PyType_Modified(PyTypeObject* type) noexcept {
-    // We don't cache anything yet that would need to be invalidated:
+    PyObject* raw, *ref;
+    Py_ssize_t i, n;
+
+    if (!PyType_HasFeature(type, Py_TPFLAGS_VALID_VERSION_TAG))
+        return;
+
+    raw = type->tp_subclasses;
+    if (raw != NULL) {
+        n = PyList_GET_SIZE(raw);
+        for (i = 0; i < n; i++) {
+            ref = PyList_GET_ITEM(raw, i);
+            ref = PyWeakref_GET_OBJECT(ref);
+            if (ref != Py_None) {
+                PyType_Modified((PyTypeObject*)ref);
+            }
+        }
+    }
+    type->tp_flags &= ~Py_TPFLAGS_VALID_VERSION_TAG;
 }
 
 template <ExceptionStyle S>
@@ -3367,6 +3402,12 @@ extern "C" void PyType_GiveHcAttrsDictDescr(PyTypeObject* cls) noexcept {
 }
 
 extern "C" int PyType_Ready(PyTypeObject* cls) noexcept {
+    // if this type is already in ready state we are finished.
+    if (cls->tp_flags & Py_TPFLAGS_READY) {
+        assert(cls->tp_dict != NULL);
+        return 0;
+    }
+
     ASSERT(!cls->is_pyston_class, "should not call this on Pyston classes");
 
     gc::registerNonheapRootObject(cls, sizeof(PyTypeObject));
@@ -3391,6 +3432,9 @@ extern "C" int PyType_Ready(PyTypeObject* cls) noexcept {
     // RELEASE_ASSERT(cls->tp_weaklistoffset == 0, "");
     // RELEASE_ASSERT(cls->tp_traverse == NULL, "");
     // RELEASE_ASSERT(cls->tp_clear == NULL, "");
+
+    // set this flag early because some function check if it is set pretty early
+    cls->is_user_defined = true;
 
     assert(cls->attrs.hcls == NULL);
     new (&cls->attrs) HCAttrs(HiddenClass::makeSingleton());
@@ -3475,7 +3519,6 @@ extern "C" int PyType_Ready(PyTypeObject* cls) noexcept {
         cls->gc_visit = &conservativeAndBasesGCHandler;
     else
         cls->gc_visit = &conservativeGCHandler;
-    cls->is_user_defined = true;
 
 
     if (!cls->instancesHaveHCAttrs() && cls->tp_base) {
@@ -3504,6 +3547,7 @@ extern "C" int PyType_Ready(PyTypeObject* cls) noexcept {
         exception_types.push_back(cls);
     }
 
+    cls->tp_flags |= Py_TPFLAGS_READY;
     return 0;
 }
 

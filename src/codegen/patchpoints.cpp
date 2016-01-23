@@ -34,6 +34,9 @@ void PatchpointInfo::addFrameVar(llvm::StringRef name, CompilerType* type) {
 }
 
 int ICSetupInfo::totalSize() const {
+    if (isDeopt())
+        return DEOPT_CALL_ONLY_SIZE;
+
     int call_size = CALL_ONLY_SIZE;
     if (getCallingConvention() != llvm::CallingConv::C) {
         // 14 bytes per reg that needs to be spilled
@@ -76,16 +79,6 @@ void PatchpointInfo::parseLocationMap(StackMap::Record* r, LocationMap* map) {
     int cur_arg = frameStackmapArgsStart();
 
     // printf("parsing pp %ld:\n", reinterpret_cast<int64_t>(this));
-
-    StackMap::Record::Location frame_info_location = r->locations[cur_arg];
-    cur_arg++;
-    // We could allow the frame_info to exist in a different location for each callsite,
-    // but in reality it will always live at a fixed stack offset.
-    if (map->frameInfoFound()) {
-        assert(frame_info_location == map->frame_info_location);
-    } else {
-        map->frame_info_location = frame_info_location;
-    }
 
     for (FrameVarInfo& frame_var : frame_vars) {
         int num_args = frame_var.type->numFrameArgs();
@@ -162,6 +155,16 @@ void processStackmap(CompiledFunction* cf, StackMap* stackmap) {
         PatchpointInfo* pp = new_patchpoints[r->id].first;
         assert(pp);
 
+        if (pp->isFrameInfoStackmap()) {
+            assert(r->locations.size() == pp->totalStackmapArgs());
+            StackMap::Record::Location frame_info_location = r->locations[0];
+            assert(!cf->location_map->frameInfoFound());
+            assert(frame_info_location.type == StackMap::Record::Location::Direct);
+            assert(frame_info_location.regnum == 6 /* must be rbp based */);
+            cf->location_map->frame_info_location = frame_info_location;
+            continue;
+        }
+
         void* slowpath_func = PatchpointInfo::getSlowpathAddr(r->id);
         if (VERBOSITY() >= 2) {
             printf("Processing pp %ld; [%d, %d)\n", reinterpret_cast<int64_t>(pp), r->offset,
@@ -198,7 +201,8 @@ void processStackmap(CompiledFunction* cf, StackMap* stackmap) {
             if (spilled)
                 nspills++;
         }
-        ASSERT(nspills <= MAX_FRAME_SPILLS, "did %d spills but expected only %d!", nspills, MAX_FRAME_SPILLS);
+        RELEASE_ASSERT(nspills <= pp->numFrameSpillsSupported(), "did %d spills but expected only %d!", nspills,
+                       pp->numFrameSpillsSupported());
 
         assert(scratch_size % sizeof(void*) == 0);
         assert(scratch_rbp_offset % sizeof(void*) == 0);
@@ -216,7 +220,6 @@ void processStackmap(CompiledFunction* cf, StackMap* stackmap) {
                                   frame_remapped);
             continue;
         }
-
         LiveOutSet live_outs(extractLiveOuts(r, ic->getCallingConvention()));
 
         if (ic->hasReturnValue()) {
@@ -287,16 +290,31 @@ void* PatchpointInfo::getSlowpathAddr(unsigned int pp_id) {
     return new_patchpoints[pp_id].second;
 }
 
+int numSlots(ICInfo* bjit_ic_info, int default_num_slots) {
+    if (!bjit_ic_info)
+        return default_num_slots;
+
+    // this thresholds are chosen by running the benchmarks several times with different settings.
+    int num_slots = std::max(bjit_ic_info->getNumSlots(), default_num_slots);
+    if (bjit_ic_info->isMegamorphic())
+        num_slots *= 3;
+    else if (bjit_ic_info->timesRewritten() > IC_MEGAMORPHIC_THRESHOLD / 2)
+        num_slots += 2;
+    else
+        num_slots = std::min(std::max(bjit_ic_info->timesRewritten(), 1), default_num_slots);
+    return std::min(num_slots, 10);
+}
+
 ICSetupInfo* createGenericIC(TypeRecorder* type_recorder, bool has_return_value, int size) {
     return ICSetupInfo::initialize(has_return_value, 1, size, ICSetupInfo::Generic, type_recorder);
 }
 
-ICSetupInfo* createGetattrIC(TypeRecorder* type_recorder) {
-    return ICSetupInfo::initialize(true, 2, 512, ICSetupInfo::Getattr, type_recorder);
+ICSetupInfo* createGetattrIC(TypeRecorder* type_recorder, ICInfo* bjit_ic_info) {
+    return ICSetupInfo::initialize(true, numSlots(bjit_ic_info, 2), 512, ICSetupInfo::Getattr, type_recorder);
 }
 
-ICSetupInfo* createGetitemIC(TypeRecorder* type_recorder) {
-    return ICSetupInfo::initialize(true, 1, 512, ICSetupInfo::Getitem, type_recorder);
+ICSetupInfo* createGetitemIC(TypeRecorder* type_recorder, ICInfo* bjit_ic_info) {
+    return ICSetupInfo::initialize(true, numSlots(bjit_ic_info, 1), 512, ICSetupInfo::Getitem, type_recorder);
 }
 
 ICSetupInfo* createSetitemIC(TypeRecorder* type_recorder) {
@@ -307,27 +325,25 @@ ICSetupInfo* createDelitemIC(TypeRecorder* type_recorder) {
     return ICSetupInfo::initialize(false, 1, 512, ICSetupInfo::Delitem, type_recorder);
 }
 
-ICSetupInfo* createSetattrIC(TypeRecorder* type_recorder) {
-    return ICSetupInfo::initialize(false, 2, 512, ICSetupInfo::Setattr, type_recorder);
+ICSetupInfo* createSetattrIC(TypeRecorder* type_recorder, ICInfo* bjit_ic_info) {
+    return ICSetupInfo::initialize(false, numSlots(bjit_ic_info, 2), 512, ICSetupInfo::Setattr, type_recorder);
 }
 
 ICSetupInfo* createDelattrIC(TypeRecorder* type_recorder) {
     return ICSetupInfo::initialize(false, 1, 144, ICSetupInfo::Delattr, type_recorder);
 }
 
-ICSetupInfo* createCallsiteIC(TypeRecorder* type_recorder, int num_args) {
-    // TODO These are very large, but could probably be made much smaller with IC optimizations
-    // - using rewriter2 for better code
-    // - not emitting duplicate guards
-    return ICSetupInfo::initialize(true, 4, 640 + 48 * num_args, ICSetupInfo::Callsite, type_recorder);
+ICSetupInfo* createCallsiteIC(TypeRecorder* type_recorder, int num_args, ICInfo* bjit_ic_info) {
+    return ICSetupInfo::initialize(true, numSlots(bjit_ic_info, 4), 640 + 48 * num_args, ICSetupInfo::Callsite,
+                                   type_recorder);
 }
 
 ICSetupInfo* createGetGlobalIC(TypeRecorder* type_recorder) {
     return ICSetupInfo::initialize(true, 1, 128, ICSetupInfo::GetGlobal, type_recorder);
 }
 
-ICSetupInfo* createBinexpIC(TypeRecorder* type_recorder) {
-    return ICSetupInfo::initialize(true, 4, 512, ICSetupInfo::Binexp, type_recorder);
+ICSetupInfo* createBinexpIC(TypeRecorder* type_recorder, ICInfo* bjit_ic_info) {
+    return ICSetupInfo::initialize(true, numSlots(bjit_ic_info, 4), 512, ICSetupInfo::Binexp, type_recorder);
 }
 
 ICSetupInfo* createNonzeroIC(TypeRecorder* type_recorder) {
@@ -336,6 +352,10 @@ ICSetupInfo* createNonzeroIC(TypeRecorder* type_recorder) {
 
 ICSetupInfo* createHasnextIC(TypeRecorder* type_recorder) {
     return ICSetupInfo::initialize(true, 2, 64, ICSetupInfo::Hasnext, type_recorder);
+}
+
+ICSetupInfo* createDeoptIC() {
+    return ICSetupInfo::initialize(true, 1, 0, ICSetupInfo::Deopt, NULL);
 }
 
 } // namespace pyston

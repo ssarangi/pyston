@@ -90,10 +90,10 @@ extern "C" BoxedString* EmptyString;
 extern "C" {
 extern BoxedClass* object_cls, *type_cls, *bool_cls, *int_cls, *long_cls, *float_cls, *str_cls, *function_cls,
     *none_cls, *instancemethod_cls, *list_cls, *slice_cls, *module_cls, *dict_cls, *tuple_cls, *file_cls,
-    *enumerate_cls, *xrange_cls, *member_descriptor_cls, *method_cls, *closure_cls, *generator_cls, *complex_cls,
-    *basestring_cls, *property_cls, *staticmethod_cls, *classmethod_cls, *attrwrapper_cls, *pyston_getset_cls,
-    *capi_getset_cls, *builtin_function_or_method_cls, *set_cls, *frozenset_cls, *code_cls, *frame_cls, *capifunc_cls,
-    *wrapperdescr_cls, *wrapperobject_cls;
+    *enumerate_cls, *xrange_cls, *member_descriptor_cls, *null_importer_cls, *method_cls, *closure_cls, *generator_cls,
+    *complex_cls, *basestring_cls, *property_cls, *staticmethod_cls, *classmethod_cls, *attrwrapper_cls,
+    *pyston_getset_cls, *capi_getset_cls, *builtin_function_or_method_cls, *set_cls, *frozenset_cls, *code_cls,
+    *frame_cls, *capifunc_cls, *wrapperdescr_cls, *wrapperobject_cls;
 }
 #define unicode_cls (&PyUnicode_Type)
 #define memoryview_cls (&PyMemoryView_Type)
@@ -161,19 +161,28 @@ extern "C" Box* decodeUTF8StringPtr(llvm::StringRef s);
 
 extern "C" inline void listAppendInternal(Box* self, Box* v) __attribute__((visibility("default")));
 extern "C" void listAppendArrayInternal(Box* self, Box** v, int nelts);
-extern "C" Box* boxCLFunction(CLFunction* f, BoxedClosure* closure, Box* globals,
-                              std::initializer_list<Box*> defaults) noexcept;
-extern "C" CLFunction* unboxCLFunction(Box* b);
+extern "C" Box* createFunctionFromMetadata(FunctionMetadata* f, BoxedClosure* closure, Box* globals,
+                                           std::initializer_list<Box*> defaults) noexcept;
+extern "C" FunctionMetadata* getFunctionMetadata(Box* b);
 extern "C" Box* createUserClass(BoxedString* name, Box* base, Box* attr_dict);
 extern "C" double unboxFloat(Box* b);
 extern "C" Box* createDict();
 extern "C" Box* createList();
 extern "C" Box* createSlice(Box* start, Box* stop, Box* step);
 extern "C" Box* createTuple(int64_t nelts, Box** elts);
-extern "C" void printFloat(double d);
 
 Box* objectStr(Box*);
 Box* objectRepr(Box*);
+
+void checkAndThrowCAPIException();
+void throwCAPIException() __attribute__((noreturn));
+void ensureCAPIExceptionSet();
+struct ExcInfo;
+void setCAPIException(const ExcInfo& e);
+
+// Finalizer-related
+void default_free(void*);
+void dealloc_null(Box* box);
 
 // In Pyston, this is the same type as CPython's PyTypeObject (they are interchangeable, but we
 // use BoxedClass in Pyston wherever possible as a convention).
@@ -188,11 +197,12 @@ public:
 
     // TODO: these don't actually get deallocated right now
     std::unique_ptr<CallattrCapiIC> next_ic;
-    std::unique_ptr<CallattrIC> hasnext_ic, repr_ic;
+    std::unique_ptr<CallattrIC> hasnext_ic, repr_ic, iter_ic;
     std::unique_ptr<NonzeroIC> nonzero_ic;
     Box* callHasnextIC(Box* obj, bool null_on_nonexistent);
     Box* call_nextIC(Box* obj) noexcept;
     Box* callReprIC(Box* obj);
+    Box* callIterIC(Box* obj);
     bool callNonzeroIC(Box* obj);
 
     gcvisit_func gc_visit;
@@ -246,7 +256,7 @@ public:
     bool has_subclasscheck;
     bool has_getattribute;
 
-    typedef bool (*pyston_inquiry)(Box*);
+    typedef llvm_compat_bool (*pyston_inquiry)(Box*);
 
     // tpp_descr_get is currently just a cache only for the use of tp_descr_get, and shouldn't
     // be called or examined by clients:
@@ -300,6 +310,10 @@ protected:
     friend void setupThread();
 };
 
+// Corresponds to PyHeapTypeObject.  Very similar to BoxedClass, but allocates some extra space for
+// structures that otherwise might get allocated statically.  For instance, tp_as_number for builtin
+// types will usually point to a `static PyNumberMethods` object, but for a heap-allocated class it
+// will point to `this->as_number`.
 class BoxedHeapClass : public BoxedClass {
 public:
     PyNumberMethods as_number;
@@ -329,6 +343,7 @@ private:
     friend void setupThread();
 };
 
+// Assert that our data structures have the same layout as the C API ones with which they need to be interchangeable.
 static_assert(sizeof(pyston::Box) == sizeof(struct _object), "");
 static_assert(offsetof(pyston::Box, cls) == offsetof(struct _object, ob_type), "");
 
@@ -374,6 +389,10 @@ public:
     DEFAULT_CLASS_SIMPLE(complex_cls);
 };
 
+static_assert(sizeof(BoxedComplex) == sizeof(PyComplexObject), "");
+static_assert(offsetof(BoxedComplex, real) == offsetof(PyComplexObject, cval.real), "");
+static_assert(offsetof(BoxedComplex, imag) == offsetof(PyComplexObject, cval.imag), "");
+
 class BoxedBool : public BoxedInt {
 public:
     BoxedBool(bool b) __attribute__((visibility("default"))) : BoxedInt(b ? 1 : 0) {}
@@ -387,7 +406,9 @@ public:
     // optimizations and inlining, creating a new one each time shouldn't have any cost.
     llvm::StringRef s() const { return llvm::StringRef(s_data, ob_size); };
 
-    char interned_state;
+    long hash; // -1 means not yet computed
+    int interned_state;
+    char s_data[0];
 
     char* data() { return s_data; }
     const char* c_str() {
@@ -430,6 +451,7 @@ public:
     // creates an uninitialized string of length n; useful for directly constructing into the string and avoiding
     // copies:
     static BoxedString* createUninitializedString(ssize_t n) { return new (n) BoxedString(n); }
+    static BoxedString* createUninitializedString(BoxedClass* cls, ssize_t n) { return new (cls, n) BoxedString(n); }
 
     // Gets a writeable pointer to the contents of a string.
     // Is only meant to be used with something just created from createUninitializedString(), though
@@ -441,12 +463,16 @@ private:
 
     BoxedString(size_t n); // non-initializing constructor
 
-    char s_data[0];
-
     friend void setupRuntime();
 };
+static_assert(sizeof(BoxedString) == sizeof(PyStringObject), "");
+static_assert(offsetof(BoxedString, ob_size) == offsetof(PyStringObject, ob_size), "");
+static_assert(offsetof(BoxedString, hash) == offsetof(PyStringObject, ob_shash), "");
+static_assert(offsetof(BoxedString, interned_state) == offsetof(PyStringObject, ob_sstate), "");
+static_assert(offsetof(BoxedString, s_data) == offsetof(PyStringObject, ob_sval), "");
 
 extern "C" size_t strHashUnboxed(BoxedString* self);
+extern "C" int64_t hashUnboxed(Box* obj);
 
 class BoxedInstanceMethod : public Box {
 public:
@@ -665,7 +691,7 @@ public:
     // CPython declares ob_item (their version of elts) to have 1 element.  We want to
     // copy that behavior so that the sizes of the objects match, but we want to also
     // have a zero-length array in there since we have some extra compiler warnings turned
-    // on.  _elts[1] will throw an error, but elts[1] will not.
+    // on:  _elts[1] will throw an error, but elts[1] will not.
     union {
         Box* elts[0];
         Box* _elts[1];
@@ -677,22 +703,44 @@ static_assert(offsetof(BoxedTuple, elts) == offsetof(PyTupleObject, ob_item), ""
 
 extern BoxedString* characters[UCHAR_MAX + 1];
 
+// C++ functor objects that implement Python semantics.
 struct PyHasher {
-    size_t operator()(Box*) const;
+    size_t operator()(Box* b) const {
+        if (b->cls == str_cls) {
+            auto s = static_cast<BoxedString*>(b);
+            if (s->hash != -1)
+                return s->hash;
+            return strHashUnboxed(s);
+        }
+        return hashUnboxed(b);
+    }
 };
 
 struct PyEq {
-    bool operator()(Box*, Box*) const;
+    bool operator()(Box* lhs, Box* rhs) const {
+        int r = PyObject_RichCompareBool(lhs, rhs, Py_EQ);
+        if (r == -1)
+            throwCAPIException();
+        return (bool)r;
+    }
 };
 
 struct PyLt {
-    bool operator()(Box*, Box*) const;
+    bool operator()(Box* lhs, Box* rhs) const {
+        int r = PyObject_RichCompareBool(lhs, rhs, Py_LT);
+        if (r == -1)
+            throwCAPIException();
+        return (bool)r;
+    }
 };
 
 // llvm::DenseMap doesn't store the original hash values, choosing to instead
 // check for equality more often.  This is probably a good tradeoff when the keys
-// are pointers and comparison is cheap, but we want to make sure that keys with
-// different hash values don't get compared.
+// are pointers and comparison is cheap, but when the equality function is user-defined
+// it can be much faster to avoid Python function invocations by doing some integer
+// comparisons.
+// This also has a user-visible behavior difference of how many times the hash function
+// and equality functions get called.
 struct BoxAndHash {
     Box* value;
     size_t hash;
@@ -763,7 +811,7 @@ class BoxedFunctionBase : public Box {
 public:
     Box** in_weakreflist;
 
-    CLFunction* f;
+    FunctionMetadata* md;
 
     // TODO these should really go in BoxedFunction but it's annoying because they don't get
     // initializd until after BoxedFunctionBase's constructor is run which means they could have
@@ -782,12 +830,12 @@ public:
     BoxedString* name; // __name__ (should be here or in one of the derived classes?)
     Box* doc;          // __doc__
 
-    BoxedFunctionBase(CLFunction* f);
-    BoxedFunctionBase(CLFunction* f, std::initializer_list<Box*> defaults, BoxedClosure* closure = NULL,
+    BoxedFunctionBase(FunctionMetadata* md);
+    BoxedFunctionBase(FunctionMetadata* md, std::initializer_list<Box*> defaults, BoxedClosure* closure = NULL,
                       Box* globals = NULL, bool can_change_defaults = false);
 
     ParamReceiveSpec getParamspec() {
-        return ParamReceiveSpec(f->num_args, defaults ? defaults->size() : 0, f->takes_varargs, f->takes_kwargs);
+        return ParamReceiveSpec(md->num_args, defaults ? defaults->size() : 0, md->takes_varargs, md->takes_kwargs);
     }
 };
 
@@ -795,8 +843,8 @@ class BoxedFunction : public BoxedFunctionBase {
 public:
     HCAttrs attrs;
 
-    BoxedFunction(CLFunction* f);
-    BoxedFunction(CLFunction* f, std::initializer_list<Box*> defaults, BoxedClosure* closure = NULL,
+    BoxedFunction(FunctionMetadata* md);
+    BoxedFunction(FunctionMetadata* md, std::initializer_list<Box*> defaults, BoxedClosure* closure = NULL,
                   Box* globals = NULL, bool can_change_defaults = false);
 
     DEFAULT_CLASS(function_cls);
@@ -806,8 +854,8 @@ public:
 
 class BoxedBuiltinFunctionOrMethod : public BoxedFunctionBase {
 public:
-    BoxedBuiltinFunctionOrMethod(CLFunction* f, const char* name, const char* doc = NULL);
-    BoxedBuiltinFunctionOrMethod(CLFunction* f, const char* name, std::initializer_list<Box*> defaults,
+    BoxedBuiltinFunctionOrMethod(FunctionMetadata* f, const char* name, const char* doc = NULL);
+    BoxedBuiltinFunctionOrMethod(FunctionMetadata* f, const char* name, std::initializer_list<Box*> defaults,
                                  BoxedClosure* closure = NULL, const char* doc = NULL);
 
     DEFAULT_CLASS(builtin_function_or_method_cls);
@@ -903,9 +951,12 @@ public:
     Box* (*get)(Box*, void*);
     void (*set)(Box*, Box*, void*);
     void* closure;
+    BoxedString* name;
 
-    BoxedGetsetDescriptor(Box* (*get)(Box*, void*), void (*set)(Box*, Box*, void*), void* closure)
-        : get(get), set(set), closure(closure) {}
+    BoxedGetsetDescriptor(BoxedString* name, Box* (*get)(Box*, void*), void (*set)(Box*, Box*, void*), void* closure)
+        : get(get), set(set), closure(closure), name(name) {}
+
+    static void gcHandler(GCVisitor* v, Box* b);
 
     // No DEFAULT_CLASS annotation here -- force callers to explicitly specifiy pyston_getset_cls or capi_getset_cls
 };
@@ -1077,12 +1128,6 @@ AST* unboxAst(Box* b);
 // Our default for tp_alloc:
 extern "C" PyObject* PystonType_GenericAlloc(BoxedClass* cls, Py_ssize_t nitems) noexcept;
 
-void checkAndThrowCAPIException();
-void throwCAPIException() __attribute__((noreturn));
-void ensureCAPIExceptionSet();
-struct ExcInfo;
-void setCAPIException(const ExcInfo& e);
-
 #define fatalOrError(exception, message)                                                                               \
     do {                                                                                                               \
         if (CONTINUE_AFTER_FATAL)                                                                                      \
@@ -1097,8 +1142,8 @@ void setCAPIException(const ExcInfo& e);
 extern Box* dict_descr;
 
 Box* codeForFunction(BoxedFunction*);
-Box* codeForCLFunction(CLFunction*);
-CLFunction* clfunctionFromCode(Box* code);
+Box* codeForFunctionMetadata(FunctionMetadata*);
+FunctionMetadata* metadataFromCode(Box* code);
 
 Box* getFrame(int depth);
 

@@ -130,6 +130,98 @@ static PyObject* err_iterbuffered(void) noexcept {
     return NULL;
 }
 
+/*
+** Py_UniversalNewlineFgets is an fgets variation that understands
+** all of \r, \n and \r\n conventions.
+** The stream should be opened in binary mode.
+** If fobj is NULL the routine always does newline conversion, and
+** it may peek one char ahead to gobble the second char in \r\n.
+** If fobj is non-NULL it must be a PyFileObject. In this case there
+** is no readahead but in stead a flag is used to skip a following
+** \n on the next read. Also, if the file is open in binary mode
+** the whole conversion is skipped. Finally, the routine keeps track of
+** the different types of newlines seen.
+** Note that we need no error handling: fgets() treats error and eof
+** identically.
+*/
+extern "C" char* Py_UniversalNewlineFgets(char* buf, int n, FILE* stream, PyObject* fobj) noexcept {
+    char* p = buf;
+    int c;
+    int newlinetypes = 0;
+    int skipnextlf = 0;
+    int univ_newline = 1;
+
+    if (fobj) {
+        if (!PyFile_Check(fobj)) {
+            errno = ENXIO; /* What can you do... */
+            return NULL;
+        }
+        univ_newline = ((BoxedFile*)fobj)->f_univ_newline;
+        if (!univ_newline)
+            return fgets(buf, n, stream);
+        newlinetypes = ((BoxedFile*)fobj)->f_newlinetypes;
+        skipnextlf = ((BoxedFile*)fobj)->f_skipnextlf;
+    }
+    FLOCKFILE(stream);
+    c = 'x'; /* Shut up gcc warning */
+    while (--n > 0 && (c = GETC(stream)) != EOF) {
+        if (skipnextlf) {
+            skipnextlf = 0;
+            if (c == '\n') {
+                /* Seeing a \n here with skipnextlf true
+                ** means we saw a \r before.
+                */
+                newlinetypes |= NEWLINE_CRLF;
+                c = GETC(stream);
+                if (c == EOF)
+                    break;
+            } else {
+                /*
+                ** Note that c == EOF also brings us here,
+                ** so we're okay if the last char in the file
+                ** is a CR.
+                */
+                newlinetypes |= NEWLINE_CR;
+            }
+        }
+        if (c == '\r') {
+            /* A \r is translated into a \n, and we skip
+            ** an adjacent \n, if any. We don't set the
+            ** newlinetypes flag until we've seen the next char.
+            */
+            skipnextlf = 1;
+            c = '\n';
+        } else if (c == '\n') {
+            newlinetypes |= NEWLINE_LF;
+        }
+        *p++ = c;
+        if (c == '\n')
+            break;
+    }
+    if (c == EOF && skipnextlf)
+        newlinetypes |= NEWLINE_CR;
+    FUNLOCKFILE(stream);
+    *p = '\0';
+    if (fobj) {
+        ((BoxedFile*)fobj)->f_newlinetypes = newlinetypes;
+        ((BoxedFile*)fobj)->f_skipnextlf = skipnextlf;
+    } else if (skipnextlf) {
+        /* If we have no file object we cannot save the
+        ** skipnextlf flag. We have to readahead, which
+        ** will cause a pause if we're reading from an
+        ** interactive stream, but that is very unlikely
+        ** unless we're doing something silly like
+        ** execfile("/dev/tty").
+        */
+        c = GETC(stream);
+        if (c != '\n')
+            ungetc(c, stream);
+    }
+    if (p == buf)
+        return NULL;
+    return buf;
+}
+
 static BoxedFile* dircheck(BoxedFile* f) {
 #if defined(HAVE_FSTAT) && defined(S_IFDIR) && defined(EISDIR)
     struct stat buf;
@@ -1298,6 +1390,10 @@ extern "C" int PyFile_SetEncoding(PyObject* f, const char* enc) noexcept {
     return PyFile_SetEncodingAndErrors(f, enc, NULL);
 }
 
+extern "C" PyObject* PyFile_GetEncoding(PyObject* f) noexcept {
+    return static_cast<BoxedFile*>(f)->f_encoding;
+}
+
 extern "C" int PyFile_SetEncodingAndErrors(PyObject* f, const char* enc, char* errors) noexcept {
     BoxedFile* file = static_cast<BoxedFile*>(f);
     PyObject* str, *oerrors;
@@ -1757,34 +1853,39 @@ void setupFile() {
     file_cls->tp_dealloc = fileDestructor;
     file_cls->has_safe_tp_dealloc = true;
 
-    file_cls->giveAttr("read", new BoxedFunction(boxRTFunction((void*)fileRead, STR, 2, false, false), { boxInt(-1) }));
+    file_cls->giveAttr(
+        "read", new BoxedFunction(FunctionMetadata::create((void*)fileRead, STR, 2, false, false), { boxInt(-1) }));
 
-    CLFunction* readline = boxRTFunction((void*)fileReadline1, STR, 1);
+    FunctionMetadata* readline = FunctionMetadata::create((void*)fileReadline1, STR, 1);
     file_cls->giveAttr("readline", new BoxedFunction(readline));
 
-    file_cls->giveAttr("flush", new BoxedFunction(boxRTFunction((void*)fileFlush, NONE, 1)));
-    file_cls->giveAttr("write", new BoxedFunction(boxRTFunction((void*)fileWrite, NONE, 2)));
-    file_cls->giveAttr("close", new BoxedFunction(boxRTFunction((void*)fileClose, UNKNOWN, 1)));
-    file_cls->giveAttr("fileno", new BoxedFunction(boxRTFunction((void*)fileFileno, BOXED_INT, 1)));
+    file_cls->giveAttr("flush", new BoxedFunction(FunctionMetadata::create((void*)fileFlush, NONE, 1)));
+    file_cls->giveAttr("write", new BoxedFunction(FunctionMetadata::create((void*)fileWrite, NONE, 2)));
+    file_cls->giveAttr("close", new BoxedFunction(FunctionMetadata::create((void*)fileClose, UNKNOWN, 1)));
+    file_cls->giveAttr("fileno", new BoxedFunction(FunctionMetadata::create((void*)fileFileno, BOXED_INT, 1)));
 
-    file_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)fileRepr, STR, 1)));
+    file_cls->giveAttr("__repr__", new BoxedFunction(FunctionMetadata::create((void*)fileRepr, STR, 1)));
 
-    file_cls->giveAttr("__enter__", new BoxedFunction(boxRTFunction((void*)fileEnter, typeFromClass(file_cls), 1)));
-    file_cls->giveAttr("__exit__", new BoxedFunction(boxRTFunction((void*)fileExit, UNKNOWN, 4)));
+    file_cls->giveAttr("__enter__",
+                       new BoxedFunction(FunctionMetadata::create((void*)fileEnter, typeFromClass(file_cls), 1)));
+    file_cls->giveAttr("__exit__", new BoxedFunction(FunctionMetadata::create((void*)fileExit, UNKNOWN, 4)));
 
     file_cls->giveAttr("__iter__", file_cls->getattr(internStringMortal("__enter__")));
-    file_cls->giveAttr("__hasnext__", new BoxedFunction(boxRTFunction((void*)fileIterHasNext, BOXED_BOOL, 1)));
-    file_cls->giveAttr("next", new BoxedFunction(boxRTFunction((void*)fileIterNext, STR, 1)));
+    file_cls->giveAttr("__hasnext__",
+                       new BoxedFunction(FunctionMetadata::create((void*)fileIterHasNext, BOXED_BOOL, 1)));
+    file_cls->giveAttr("next", new BoxedFunction(FunctionMetadata::create((void*)fileIterNext, STR, 1)));
 
-    file_cls->giveAttr("tell", new BoxedFunction(boxRTFunction((void*)fileTell, UNKNOWN, 1)));
+    file_cls->giveAttr("tell", new BoxedFunction(FunctionMetadata::create((void*)fileTell, UNKNOWN, 1)));
     file_cls->giveAttr("softspace",
                        new BoxedMemberDescriptor(BoxedMemberDescriptor::INT, offsetof(BoxedFile, f_softspace), false));
     file_cls->giveAttr("name",
                        new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedFile, f_name), true));
     file_cls->giveAttr("mode",
                        new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedFile, f_mode), true));
+    file_cls->giveAttr("encoding",
+                       new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedFile, f_encoding), true));
 
-    file_cls->giveAttr("__new__", new BoxedFunction(boxRTFunction((void*)fileNew, UNKNOWN, 4, false, false),
+    file_cls->giveAttr("__new__", new BoxedFunction(FunctionMetadata::create((void*)fileNew, UNKNOWN, 4, false, false),
                                                     { boxString("r"), boxInt(-1) }));
 
     for (auto& md : file_methods) {
@@ -1793,7 +1894,8 @@ void setupFile() {
 
     for (auto& getset : file_getsetlist) {
         file_cls->giveAttr(getset.name, new (capi_getset_cls) BoxedGetsetDescriptor(
-                                            getset.get, (void (*)(Box*, Box*, void*))getset.set, getset.closure));
+                                            internStringMortal(getset.name), getset.get,
+                                            (void (*)(Box*, Box*, void*))getset.set, getset.closure));
     }
 
     file_cls->freeze();

@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "llvm/Analysis/Passes.h"
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -368,6 +369,8 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
         llvm_entry_blocks[block] = llvm::BasicBlock::Create(g.context, buf, irstate->getLLVMFunction());
     }
 
+    llvm::Value* osr_frame_info_arg = NULL;
+
     // the function entry block, where we add the type guards [no guards anymore]
     llvm::BasicBlock* osr_entry_block = NULL;
     llvm::BasicBlock* osr_unbox_block_end = NULL; // the block after type guards where we up/down-convert things
@@ -437,14 +440,8 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
 
             if (from_arg->getType() == g.llvm_frame_info_type->getPointerTo()) {
                 assert(p.first.s() == FRAME_INFO_PTR_NAME);
-                irstate->setFrameInfoArgument(from_arg);
+                osr_frame_info_arg = from_arg;
                 // Don't add the frame info to the symbol table since we will store it separately:
-                continue;
-            }
-
-            if (p.first.s() == PASSED_GLOBALS_NAME) {
-                assert(!source->scoping->areGlobalsFromModule());
-                irstate->setGlobals(from_arg);
                 continue;
             }
 
@@ -608,12 +605,12 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
             assert(osr_entry_block);
             assert(phis);
 
+            irstate->setupFrameInfoVarOSR(osr_frame_info_arg);
+
             for (const auto& p : entry_descriptor->args) {
                 // Don't add the frame info to the symbol table since we will store it separately
                 // (we manually added it during the calculation of osr_syms):
                 if (p.first.s() == FRAME_INFO_PTR_NAME)
-                    continue;
-                if (p.first.s() == PASSED_GLOBALS_NAME)
                     continue;
 
                 ConcreteCompilerType* analyzed_type = getTypeAtBlockStart(types, p.first, block);
@@ -973,7 +970,7 @@ static std::string getUniqueFunctionName(std::string nameprefix, EffortLevel eff
     return os.str();
 }
 
-CompiledFunction* doCompile(CLFunction* clfunc, SourceInfo* source, ParamNames* param_names,
+CompiledFunction* doCompile(FunctionMetadata* md, SourceInfo* source, ParamNames* param_names,
                             const OSREntryDescriptor* entry_descriptor, EffortLevel effort,
                             ExceptionStyle exception_style, FunctionSpecialization* spec, llvm::StringRef nameprefix) {
     Timer _t("in doCompile");
@@ -1092,7 +1089,7 @@ CompiledFunction* doCompile(CLFunction* clfunc, SourceInfo* source, ParamNames* 
     else
         phis = computeRequiredPhis(*param_names, source->cfg, liveness, source->getScopeInfo());
 
-    IRGenState irstate(clfunc, cf, source, std::move(phis), param_names, getGCBuilder(), dbg_funcinfo);
+    IRGenState irstate(md, cf, source, std::move(phis), param_names, getGCBuilder(), dbg_funcinfo);
 
     emitBBs(&irstate, types, entry_descriptor, blocks);
 
@@ -1120,8 +1117,18 @@ CompiledFunction* doCompile(CLFunction* clfunc, SourceInfo* source, ParamNames* 
     static StatCounter us_irgen("us_compiling_irgen");
     us_irgen.log(irgen_us);
 
-    if (ENABLE_LLVMOPTS)
-        optimizeIR(f, effort);
+
+    // Calculate the module hash before doing any optimizations.
+    // This has the advantage that we can skip running the opt passes when we have cached object file
+    // but the disadvantage that optimizations are not allowed to add new symbolic constants...
+    if (ENABLE_JIT_OBJECT_CACHE) {
+        g.object_cache->calculateModuleHash(g.cur_module, effort);
+        if (ENABLE_LLVMOPTS && !g.object_cache->haveCacheFileForHash())
+            optimizeIR(f, effort);
+    } else {
+        if (ENABLE_LLVMOPTS)
+            optimizeIR(f, effort);
+    }
 
     g.cur_module = NULL;
 

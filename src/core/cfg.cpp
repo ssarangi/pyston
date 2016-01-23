@@ -256,7 +256,7 @@ private:
         curblock = NULL;
     }
 
-    void doContinue() {
+    void doContinue(AST* value) {
         assert(curblock);
         for (auto& cont : llvm::make_range(continuations.rbegin(), continuations.rend())) {
             if (cont.continue_dest) {
@@ -270,10 +270,10 @@ private:
             }
         }
 
-        raiseExcHelper(SyntaxError, "'continue' not properly in loop");
+        raiseSyntaxError("'continue' not properly in loop", value->lineno, value->col_offset, source->getFn()->s(), "", true);
     }
 
-    void doBreak() {
+    void doBreak(AST* value) {
         assert(curblock);
         for (auto& cont : llvm::make_range(continuations.rbegin(), continuations.rend())) {
             if (cont.break_dest) {
@@ -287,7 +287,7 @@ private:
             }
         }
 
-        raiseExcHelper(SyntaxError, "'break' outside loop");
+        raiseSyntaxError("'break' outside loop", value->lineno, value->col_offset, source->getFn()->s(), "", true);
     }
 
     AST_expr* callNonzero(AST_expr* e) {
@@ -1322,10 +1322,10 @@ private:
                 doReturn(makeLoad(internString(RETURN_NAME), node));
                 break;
             case Why::BREAK:
-                doBreak();
+                doBreak(node);
                 break;
             case Why::CONTINUE:
-                doContinue();
+                doContinue(node);
                 break;
             case Why::FALLTHROUGH:
                 assert(exit_block);
@@ -1973,7 +1973,7 @@ public:
     bool visit_break(AST_Break* node) override {
         assert(curblock);
 
-        doBreak();
+        doBreak(node);
         assert(!curblock);
         return true;
     }
@@ -1981,7 +1981,7 @@ public:
     bool visit_continue(AST_Continue* node) override {
         assert(curblock);
 
-        doContinue();
+        doContinue(node);
         assert(!curblock);
         return true;
     }
@@ -2528,10 +2528,11 @@ void CFG::print(llvm::raw_ostream& stream) {
 class AssignVRegsVisitor : public NoopASTVisitor {
 public:
     int index = 0;
+    bool only_user_visible;
     llvm::DenseMap<InternedString, int> sym_vreg_map;
     ScopeInfo* scope_info;
 
-    AssignVRegsVisitor(ScopeInfo* scope_info) : scope_info(scope_info) {}
+    AssignVRegsVisitor(ScopeInfo* scope_info, bool only_user_visible) : only_user_visible(only_user_visible), scope_info(scope_info) {}
 
     bool visit_arguments(AST_arguments* node) override {
         for (AST_expr* d : node->defaults)
@@ -2563,6 +2564,9 @@ public:
         if (node->vreg != -1)
             return true;
 
+        if (only_user_visible && node->id.isCompilerCreatedName())
+            return true;
+
         if (node->lookup_type == ScopeInfo::VarScopeType::UNKNOWN)
             node->lookup_type = scope_info->getScopeTypeOfName(node->id);
 
@@ -2585,23 +2589,31 @@ void CFG::assignVRegs(const ParamNames& param_names, ScopeInfo* scope_info) {
     if (has_vregs_assigned)
         return;
 
-    AssignVRegsVisitor visitor(scope_info);
-    for (CFGBlock* b : blocks) {
-        for (AST_stmt* stmt : b->body) {
-            stmt->accept(&visitor);
+    AssignVRegsVisitor visitor(scope_info, true);
+
+    // we need todo two passes: first we assign the user visible vars a vreg and then the compiler created get there value.
+    for (int i=0; i<2; ++i) {
+        for (CFGBlock* b : blocks) {
+            for (AST_stmt* stmt : b->body) {
+                stmt->accept(&visitor);
+            }
+        }
+
+        for (auto* name : param_names.arg_names) {
+            name->accept(&visitor);
+        }
+
+        if (param_names.vararg_name)
+            param_names.vararg_name->accept(&visitor);
+
+        if (param_names.kwarg_name)
+            param_names.kwarg_name->accept(&visitor);
+
+        if (visitor.only_user_visible) {
+            visitor.only_user_visible = false;
+            sym_vreg_map_user_visible = visitor.sym_vreg_map;
         }
     }
-
-    for (auto* name : param_names.arg_names) {
-        name->accept(&visitor);
-    }
-
-    if (param_names.vararg_name)
-        param_names.vararg_name->accept(&visitor);
-
-    if (param_names.kwarg_name)
-        param_names.kwarg_name->accept(&visitor);
-
     sym_vreg_map = std::move(visitor.sym_vreg_map);
     has_vregs_assigned = true;
 }

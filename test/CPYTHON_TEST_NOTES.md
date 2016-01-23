@@ -23,9 +23,7 @@ test_aifc               Unsupported subclassing from file?
 test_al                 No module named al
 test_applesingle        Not really a failure, but it tries to skip itself and we don't support that
 test_argparse           [unknown]
-test_array              [unknown]
-test_ascii_formattd     [unknown]
-test_ast                [unknown]
+test_ascii_formatd      segfault in ctypes (but only on CI)
 test_asynchat           [unknown]
 test_asyncore           [unknown]
 test_atexit             [unknown]
@@ -43,7 +41,6 @@ test_cfgparser          [unknown]
 test_cgi                [unknown]
 test_class              needs ellipsis
 test_cl                 [unknown]
-test_cmath              [unknown]
 test_cmd_line_script    [unknown]
 test_cmd_line           [unknown]
 test_codecencodings_cn  [unknown]
@@ -67,7 +64,7 @@ test_compileall         [unknown]
 test_compiler           [unknown]
 test_compile            [unknown]
 test_cookie             [unknown]
-test_copy               [unknown]
+test_copy               Please debug this test in VM.
 test_cpickle            [unknown]
 test_cprofile           [unknown]
 test_crypt              [unknown]
@@ -76,20 +73,18 @@ test_ctypes             [unknown]
 test_curses             [unknown]
 test_datetime           needs _PyObject_GetDictPtr
 test_dbm                [unknown]
-test_decimal            I think we need to copy decimaltestdata from cpython
 test_decorators         decorator bug -- we evaluate decorator obj and its args in wrong order
 test_deque              couple unknown issues
 test_descrtut           `exec in DefaultDict()`
 test_descr              wontfix: crashes at "self.__dict__ = self"
 test_dictcomps          we need to disallow assigning to dictcomps
 test_dict               misc failures related to things like gc, abc, comparisons, detecting mutations during iterations
-test_dictviews          various unique bugs
+test_dictviews          segfault calling repr on recursive dictview. remove test/tests/test_dictview.py when the orig test passes
 test_difflib            [unknown]
 test_distutils          [unknown]
 test_dis                [unknown]
 test_dl                 [unknown]
 test_doctest            hard to know.  also missing some input files
-test_docxmlrpc          [unknown]
 test_dumbdbm            [unknown]
 test_email_codecs       [unknown]
 test_email_renamed      [unknown]
@@ -101,9 +96,7 @@ test_extcall            f(**kw) crashes if kw isn't a dict
 test_file2k             we abort when you try to open() a directory
 test_file_eintr         not sure
 test_fileio             [unknown]
-test_file               wontfix: we don't destruct file objects when the test wants
 test_fork1              [unknown]
-test_fractions          [unknown]
 test_frozen             [unknown]
 test_ftplib             [unknown]
 test_funcattrs          we don't allow changing numing of function defaults
@@ -119,7 +112,6 @@ test_getargs2           [unknown]
 test_global             SyntaxWarnings for global statements after uses
 test_gl                 [unknown]
 test_grammar            bug in our tokenizer
-test_hashlib            [unknown]
 test_heapq              [unknown]
 test_hotshot            [unknown]
 test_httplib            [unknown]
@@ -144,7 +136,6 @@ test__locale            No module named _locale
 test_locale             [unknown]
 test_longexp            [unknown]
 test_long_future        [unknown]
-test_long               sys.long_info
 test_macos              Not really a failure, but it tries to skip itself and we don't support that
 test_macostools         Not really a failure, but it tries to skip itself and we don't support that
 test_mailbox            [unknown]
@@ -173,18 +164,15 @@ test_pep352             various unique bugs
 test_pickletools        [unknown]
 test_pickle             unknown
 test_pkg                unknown bug
-test_platform           [unknown]
-test_poll               [unknown]
 test_poplib             [unknown]
 test_pprint             [unknown]
 test_print              [unknown]
 test_profile            [unknown]
 test_py3kwarn           [unknown]
-test_pyclbr             [unknown]
+test_pyclbr             This test passes but takes a very long time in debug mode (60s vs 5s for release mode).
 test_py_compile         [unknown]
 test_pydoc              [unknown]
 test_random             long("invalid number")
-test_readline           [unknown]
 test_repr               complex.__hash__; some unknown issues
 test_resource           [unknown]
 test_richcmp            PyObject_Not
@@ -193,12 +181,10 @@ test_runpy              [unknown]
 test_sax                [unknown]
 test_scope              eval of code object from existing function (not currently supported)
 test_scriptpackages     [unknown]
-test_set                lots of set issues
 test_shelve             [unknown]
 test_shlex              [unknown]
 test_signal             [unknown]
 test_site               [unknown]
-test_smtplib            [unknown]
 test_smtpnet            [unknown]
 test_socketserver       [unknown]
 test_socket             [unknown]
@@ -207,9 +193,7 @@ test_sort               argument specification issue in listSort?
 test_sqlite             [unknown]
 test_ssl                [unknown]
 test_startfile          [unknown]
-test_string             infinite loops in test_replace
 test_str                memory leak?
-test_strtod             [unknown]
 test_structmembers      [unknown]
 test_struct             [unknown]
 test_subprocess         exit code 141 [sigpipe?], no error message
@@ -228,7 +212,6 @@ test_tcl                [unknown]
 test_telnetlib          [unknown]
 test_tempfile           [unknown]
 test_threaded_import    [unknown]
-test_threadedtempfile   [unknown]
 test_threading_local    [unknown]
 test_threading          [unknown]
 test_threadsignals      [unknown]
@@ -250,9 +233,7 @@ test_unicode_file       exit code 139, no error message
 test_unittest           serialize_ast assert
 test_univnewlines2k     [unknown]
 test_univnewlines       [unknown]
-test_urllib2_localnet   [unknown]
 test_urllib2net         [unknown]
-test_urllib2            segfault due to attrwrapper corruption
 test_urllibnet          [unknown]
 test_userdict           segfault: repr of recursive dict?
 test_userlist           slice(1L, 1L)

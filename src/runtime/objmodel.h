@@ -42,16 +42,10 @@ void _printStacktrace();
 
 extern "C" Box* deopt(AST_expr* expr, Box* value);
 
-// Finalizer-related
-void default_free(void*);
-void dealloc_null(Box* box);
-
 // helper function for raising from the runtime:
 void raiseExcHelper(BoxedClass*, const char* fmt, ...) __attribute__((__noreturn__))
 __attribute__((format(printf, 2, 3)));
 void raiseExcHelper(BoxedClass*, Box* arg) __attribute__((__noreturn__));
-
-BoxedModule* getCurrentModule();
 
 // TODO sort this
 extern "C" bool softspace(Box* b, bool newval);
@@ -73,9 +67,6 @@ extern "C" Box* callattrCapi(Box*, BoxedString*, CallattrFlags, Box*, Box*, Box*
                              const std::vector<BoxedString*>*) noexcept;
 extern "C" BoxedString* str(Box* obj);
 extern "C" BoxedString* repr(Box* obj);
-extern "C" BoxedString* reprOrNull(Box* obj); // similar to repr, but returns NULL on exception
-extern "C" BoxedString* strOrNull(Box* obj);  // similar to str, but returns NULL on exception
-extern "C" Box* strOrUnicode(Box* obj);
 extern "C" bool exceptionMatches(Box* obj, Box* cls);
 extern "C" BoxedInt* hash(Box* obj);
 extern "C" int64_t hashUnboxed(Box* obj);
@@ -91,6 +82,7 @@ extern "C" Box* getitem(Box* value, Box* slice);
 extern "C" Box* getitem_capi(Box* value, Box* slice) noexcept;
 extern "C" void setitem(Box* target, Box* slice, Box* value);
 extern "C" void delitem(Box* target, Box* slice);
+extern "C" PyObject* apply_slice(PyObject* u, PyObject* v, PyObject* w) noexcept;
 extern "C" Box* getclsattr(Box* obj, BoxedString* attr);
 extern "C" Box* getclsattrMaybeNonstring(Box* obj, Box* attr);
 extern "C" Box* unaryop(Box* operand, int op_type);
@@ -201,12 +193,12 @@ Box* processDescriptor(Box* obj, Box* inst, Box* owner);
 Box* processDescriptorOrNull(Box* obj, Box* inst, Box* owner);
 
 template <ExceptionStyle S, Rewritable rewritable>
-Box* callCLFunc(CLFunction* f, CallRewriteArgs* rewrite_args, int num_output_args, BoxedClosure* closure,
+Box* callCLFunc(FunctionMetadata* f, CallRewriteArgs* rewrite_args, int num_output_args, BoxedClosure* closure,
                 BoxedGenerator* generator, Box* globals, Box* oarg1, Box* oarg2, Box* oarg3,
                 Box** oargs) noexcept(S == CAPI);
 
 static const char* objectNewParameterTypeErrorMsg() {
-    if (PYTHON_VERSION_HEX >= version_hex(2, 7, 4)) {
+    if (PY_VERSION_HEX >= version_hex(2, 7, 4)) {
         return "object() takes no parameters";
     } else {
         return "object.__new__() takes no parameters";

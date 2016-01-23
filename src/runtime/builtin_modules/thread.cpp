@@ -28,6 +28,7 @@ using namespace pyston::threading;
 
 extern "C" void initthread();
 
+std::atomic_long nb_threads;
 
 static int initialized;
 static void PyThread__init_thread(void); /* Forward */
@@ -69,6 +70,8 @@ static void* thread_start(Box* target, Box* varargs, Box* kwargs) {
     timer.pushTopLevel(getCPUTicks());
 #endif
 
+    ++nb_threads;
+
     try {
         runtimeCall(target, ArgPassSpec(0, 0, true, kwargs != NULL), varargs, kwargs, NULL, NULL, NULL);
     } catch (ExcInfo e) {
@@ -78,6 +81,8 @@ static void* thread_start(Box* target, Box* varargs, Box* kwargs) {
 #if STAT_TIMERS
     timer.popTopLevel(getCPUTicks());
 #endif
+
+    --nb_threads;
 
     return NULL;
 }
@@ -190,6 +195,10 @@ Box* stackSize() {
     Py_FatalError("unimplemented");
 }
 
+Box* threadCount() {
+    return boxInt(nb_threads);
+}
+
 void setupThread() {
     // Hacky: we want to use some of CPython's implementation of the thread module (the threading local stuff),
     // and some of ours (thread handling).  Start off by calling a cut-down version of initthread, and then
@@ -200,15 +209,19 @@ void setupThread() {
     Box* thread_module = getSysModulesDict()->getOrNull(boxString("thread"));
     assert(thread_module);
 
-    thread_module->giveAttr("start_new_thread", new BoxedBuiltinFunctionOrMethod(
-                                                    boxRTFunction((void*)startNewThread, BOXED_INT, 3, false, false),
-                                                    "start_new_thread", { NULL }));
-    thread_module->giveAttr("allocate_lock", new BoxedBuiltinFunctionOrMethod(
-                                                 boxRTFunction((void*)allocateLock, UNKNOWN, 0), "allocate_lock"));
     thread_module->giveAttr(
-        "get_ident", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)getIdent, BOXED_INT, 0), "get_ident"));
+        "start_new_thread",
+        new BoxedBuiltinFunctionOrMethod(FunctionMetadata::create((void*)startNewThread, BOXED_INT, 3, false, false),
+                                         "start_new_thread", { NULL }));
     thread_module->giveAttr(
-        "stack_size", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)stackSize, BOXED_INT, 0), "stack_size"));
+        "allocate_lock",
+        new BoxedBuiltinFunctionOrMethod(FunctionMetadata::create((void*)allocateLock, UNKNOWN, 0), "allocate_lock"));
+    thread_module->giveAttr("get_ident", new BoxedBuiltinFunctionOrMethod(
+                                             FunctionMetadata::create((void*)getIdent, BOXED_INT, 0), "get_ident"));
+    thread_module->giveAttr("stack_size", new BoxedBuiltinFunctionOrMethod(
+                                              FunctionMetadata::create((void*)stackSize, BOXED_INT, 0), "stack_size"));
+    thread_module->giveAttr("_count", new BoxedBuiltinFunctionOrMethod(
+                                          FunctionMetadata::create((void*)threadCount, BOXED_INT, 0), "_count"));
 
     thread_lock_cls = BoxedClass::create(type_cls, object_cls, NULL, 0, 0, sizeof(BoxedThreadLock), false, "lock");
     thread_lock_cls->tp_dealloc = BoxedThreadLock::threadLockDestructor;
@@ -216,16 +229,18 @@ void setupThread() {
     thread_lock_cls->instances_are_nonzero = true;
 
     thread_lock_cls->giveAttr("__module__", boxString("thread"));
-    thread_lock_cls->giveAttr(
-        "acquire",
-        new BoxedFunction(boxRTFunction((void*)BoxedThreadLock::acquire, BOXED_BOOL, 2, false, false), { boxInt(1) }));
-    thread_lock_cls->giveAttr("release", new BoxedFunction(boxRTFunction((void*)BoxedThreadLock::release, NONE, 1)));
+    thread_lock_cls->giveAttr("acquire", new BoxedFunction(FunctionMetadata::create((void*)BoxedThreadLock::acquire,
+                                                                                    BOXED_BOOL, 2, false, false),
+                                                           { boxInt(1) }));
+    thread_lock_cls->giveAttr("release",
+                              new BoxedFunction(FunctionMetadata::create((void*)BoxedThreadLock::release, NONE, 1)));
     thread_lock_cls->giveAttr("acquire_lock", thread_lock_cls->getattr(internStringMortal("acquire")));
     thread_lock_cls->giveAttr("release_lock", thread_lock_cls->getattr(internStringMortal("release")));
     thread_lock_cls->giveAttr("__enter__", thread_lock_cls->getattr(internStringMortal("acquire")));
-    thread_lock_cls->giveAttr("__exit__", new BoxedFunction(boxRTFunction((void*)BoxedThreadLock::exit, NONE, 4)));
-    thread_lock_cls->giveAttr("locked",
-                              new BoxedFunction(boxRTFunction((void*)BoxedThreadLock::locked, BOXED_BOOL, 1)));
+    thread_lock_cls->giveAttr("__exit__",
+                              new BoxedFunction(FunctionMetadata::create((void*)BoxedThreadLock::exit, NONE, 4)));
+    thread_lock_cls->giveAttr(
+        "locked", new BoxedFunction(FunctionMetadata::create((void*)BoxedThreadLock::locked, BOXED_BOOL, 1)));
     thread_lock_cls->giveAttr("locked_lock", thread_lock_cls->getattr(internStringMortal("locked")));
     thread_lock_cls->freeze();
 

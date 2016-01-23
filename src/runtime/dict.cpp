@@ -22,15 +22,17 @@
 #include "runtime/ics.h"
 #include "runtime/inline/list.h"
 #include "runtime/objmodel.h"
+#include "runtime/set.h"
 #include "runtime/types.h"
 #include "runtime/util.h"
 
 namespace pyston {
 
-BoxedClass* dict_iterator_cls = NULL;
-BoxedClass* dict_keys_cls = NULL;
-BoxedClass* dict_values_cls = NULL;
-BoxedClass* dict_items_cls = NULL;
+extern "C" {
+BoxedClass* dictiterkey_cls = NULL;
+BoxedClass* dictitervalue_cls = NULL;
+BoxedClass* dictiteritem_cls = NULL;
+}
 
 Box* dictRepr(BoxedDict* self) {
     std::vector<char> chars;
@@ -145,33 +147,6 @@ extern "C" PyObject* PyDict_Values(PyObject* mp) noexcept {
 
 extern "C" PyObject* PyDict_Items(PyObject* mp) noexcept {
     return dict_helper(mp, dictItems);
-}
-
-Box* dictViewKeys(BoxedDict* self) {
-    if (!PyDict_Check(self)) {
-        raiseExcHelper(TypeError, "descriptor 'viewkeys' requires a 'dict' object but received a '%s'",
-                       getTypeName(self));
-    }
-    BoxedDictView* rtn = new (dict_keys_cls) BoxedDictView(self);
-    return rtn;
-}
-
-Box* dictViewValues(BoxedDict* self) {
-    if (!PyDict_Check(self)) {
-        raiseExcHelper(TypeError, "descriptor 'viewvalues' requires a 'dict' object but received a '%s'",
-                       getTypeName(self));
-    }
-    BoxedDictView* rtn = new (dict_values_cls) BoxedDictView(self);
-    return rtn;
-}
-
-Box* dictViewItems(BoxedDict* self) {
-    if (!PyDict_Check(self)) {
-        raiseExcHelper(TypeError, "descriptor 'viewitems' requires a 'dict' object but received a '%s'",
-                       getTypeName(self));
-    }
-    BoxedDictView* rtn = new (dict_items_cls) BoxedDictView(self);
-    return rtn;
 }
 
 // Analoguous to CPython's, used for sq_ slots.
@@ -510,11 +485,12 @@ Box* dictSetdefault(BoxedDict* self, Box* k, Box* v) {
         raiseExcHelper(TypeError, "descriptor 'setdefault' requires a 'dict' object but received a '%s'",
                        getTypeName(self));
 
-    auto it = self->d.find(k);
+    BoxAndHash k_hash(k);
+    auto it = self->d.find(k_hash);
     if (it != self->d.end())
         return it->second;
 
-    self->d.insert(std::make_pair(k, v));
+    self->d.insert(std::make_pair(k_hash, v));
     return v;
 }
 
@@ -559,8 +535,14 @@ Box* dictNonzero(BoxedDict* self) {
 
 Box* dictFromkeys(Box* cls, Box* iterable, Box* default_value) {
     auto rtn = new BoxedDict();
-    for (Box* e : iterable->pyElements()) {
-        dictSetitem(rtn, e, default_value);
+    if (PyAnySet_Check(iterable)) {
+        for (auto&& elt : ((BoxedSet*)iterable)->s) {
+            rtn->d.insert(std::make_pair(elt, default_value));
+        }
+    } else {
+        for (Box* e : iterable->pyElements()) {
+            dictSetitem(rtn, e, default_value);
+        }
     }
 
     return rtn;
@@ -739,19 +721,10 @@ void BoxedDict::gcHandler(GCVisitor* v, Box* b) {
 }
 
 void BoxedDictIterator::gcHandler(GCVisitor* v, Box* b) {
-    assert(b->cls == dict_iterator_cls);
     Box::gcHandler(v, b);
 
     BoxedDictIterator* it = static_cast<BoxedDictIterator*>(b);
     v->visit(&it->d);
-}
-
-void BoxedDictView::gcHandler(GCVisitor* v, Box* b) {
-    assert(b->cls == dict_items_cls || b->cls == dict_values_cls || b->cls == dict_keys_cls);
-    Box::gcHandler(v, b);
-
-    BoxedDictView* view = static_cast<BoxedDictView*>(b);
-    v->visit(&view->d);
 }
 
 static int dict_init(PyObject* self, PyObject* args, PyObject* kwds) noexcept {
@@ -780,91 +753,125 @@ void BoxedDict::dealloc(Box* b) noexcept {
     static_cast<BoxedDict*>(b)->d.freeAllMemory();
 }
 
+// We use cpythons dictview implementation from dictobject.c
+extern "C" PyObject* dictview_new(PyObject* dict, PyTypeObject* type) noexcept;
+Box* dictViewKeys(BoxedDict* d) {
+    Box* rtn = dictview_new(d, &PyDictKeys_Type);
+    if (!rtn)
+        throwCAPIException();
+    return rtn;
+}
+Box* dictViewValues(BoxedDict* d) {
+    Box* rtn = dictview_new(d, &PyDictValues_Type);
+    if (!rtn)
+        throwCAPIException();
+    return rtn;
+}
+Box* dictViewItems(BoxedDict* d) {
+    Box* rtn = dictview_new(d, &PyDictItems_Type);
+    if (!rtn)
+        throwCAPIException();
+    return rtn;
+}
+
+
+// This function gets called from dictobject.c
+extern "C" PyObject* dictiter_new(PyDictObject* dict, PyTypeObject* iter_type) noexcept {
+    return new (iter_type) BoxedDictIterator((BoxedDict*)dict);
+}
+
+
 void setupDict() {
     static PyMappingMethods dict_as_mapping;
     dict_cls->tp_as_mapping = &dict_as_mapping;
     static PySequenceMethods dict_as_sequence;
     dict_cls->tp_as_sequence = &dict_as_sequence;
 
-    dict_iterator_cls = BoxedClass::create(type_cls, object_cls, &BoxedDictIterator::gcHandler, 0, 0,
-                                           sizeof(BoxedDictIterator), false, "dictionary-itemiterator");
+    dictiterkey_cls = BoxedClass::create(type_cls, object_cls, &BoxedDictIterator::gcHandler, 0, 0,
+                                         sizeof(BoxedDictIterator), false, "dictionary-keyiterator");
+    dictitervalue_cls = BoxedClass::create(type_cls, object_cls, &BoxedDictIterator::gcHandler, 0, 0,
+                                           sizeof(BoxedDictIterator), false, "dictionary-valueiterator");
+    dictiteritem_cls = BoxedClass::create(type_cls, object_cls, &BoxedDictIterator::gcHandler, 0, 0,
+                                          sizeof(BoxedDictIterator), false, "dictionary-itemiterator");
 
-    dict_keys_cls = BoxedClass::create(type_cls, object_cls, &BoxedDictView::gcHandler, 0, 0, sizeof(BoxedDictView),
-                                       false, "dict_keys");
-    dict_values_cls = BoxedClass::create(type_cls, object_cls, &BoxedDictView::gcHandler, 0, 0, sizeof(BoxedDictView),
-                                         false, "dict_values");
-    dict_items_cls = BoxedClass::create(type_cls, object_cls, &BoxedDictView::gcHandler, 0, 0, sizeof(BoxedDictView),
-                                        false, "dict_items");
-
-    dict_iterator_cls->instances_are_nonzero = dict_keys_cls->instances_are_nonzero
-        = dict_values_cls->instances_are_nonzero = dict_items_cls->instances_are_nonzero = true;
+    dictiterkey_cls->instances_are_nonzero = dictitervalue_cls->instances_are_nonzero
+        = dictiteritem_cls->instances_are_nonzero = true;
 
     dict_cls->tp_dealloc = &BoxedDict::dealloc;
     dict_cls->has_safe_tp_dealloc = true;
 
-    dict_cls->giveAttr("__len__", new BoxedFunction(boxRTFunction((void*)dictLen, BOXED_INT, 1)));
-    dict_cls->giveAttr("__new__", new BoxedFunction(boxRTFunction((void*)dictNew, UNKNOWN, 1, true, true)));
-    dict_cls->giveAttr("__init__", new BoxedFunction(boxRTFunction((void*)dictInit, NONE, 1, true, true)));
-    dict_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)dictRepr, STR, 1)));
+    dict_cls->giveAttr("__len__", new BoxedFunction(FunctionMetadata::create((void*)dictLen, BOXED_INT, 1)));
+    dict_cls->giveAttr("__new__", new BoxedFunction(FunctionMetadata::create((void*)dictNew, UNKNOWN, 1, true, true)));
+    dict_cls->giveAttr("__init__", new BoxedFunction(FunctionMetadata::create((void*)dictInit, NONE, 1, true, true)));
+    dict_cls->giveAttr("__repr__", new BoxedFunction(FunctionMetadata::create((void*)dictRepr, STR, 1)));
 
-    dict_cls->giveAttr("__eq__", new BoxedFunction(boxRTFunction((void*)dictEq, UNKNOWN, 2)));
-    dict_cls->giveAttr("__ne__", new BoxedFunction(boxRTFunction((void*)dictNe, UNKNOWN, 2)));
+    dict_cls->giveAttr("__eq__", new BoxedFunction(FunctionMetadata::create((void*)dictEq, UNKNOWN, 2)));
+    dict_cls->giveAttr("__ne__", new BoxedFunction(FunctionMetadata::create((void*)dictNe, UNKNOWN, 2)));
 
-    dict_cls->giveAttr("__iter__",
-                       new BoxedFunction(boxRTFunction((void*)dictIterKeys, typeFromClass(dict_iterator_cls), 1)));
+    dict_cls->giveAttr("__iter__", new BoxedFunction(FunctionMetadata::create((void*)dictIterKeys,
+                                                                              typeFromClass(dictiterkey_cls), 1)));
 
-    dict_cls->giveAttr("update", new BoxedFunction(boxRTFunction((void*)dictUpdate, NONE, 1, true, true)));
+    dict_cls->giveAttr("update", new BoxedFunction(FunctionMetadata::create((void*)dictUpdate, NONE, 1, true, true)));
 
-    dict_cls->giveAttr("clear", new BoxedFunction(boxRTFunction((void*)dictClear, NONE, 1)));
-    dict_cls->giveAttr("copy", new BoxedFunction(boxRTFunction((void*)dictCopy, DICT, 1)));
+    dict_cls->giveAttr("clear", new BoxedFunction(FunctionMetadata::create((void*)dictClear, NONE, 1)));
+    dict_cls->giveAttr("copy", new BoxedFunction(FunctionMetadata::create((void*)dictCopy, DICT, 1)));
 
-    dict_cls->giveAttr("has_key", new BoxedFunction(boxRTFunction((void*)dictContains, BOXED_BOOL, 2)));
-    dict_cls->giveAttr("items", new BoxedFunction(boxRTFunction((void*)dictItems, LIST, 1)));
-    dict_cls->giveAttr("iteritems",
-                       new BoxedFunction(boxRTFunction((void*)dictIterItems, typeFromClass(dict_iterator_cls), 1)));
+    dict_cls->giveAttr("has_key", new BoxedFunction(FunctionMetadata::create((void*)dictContains, BOXED_BOOL, 2)));
+    dict_cls->giveAttr("items", new BoxedFunction(FunctionMetadata::create((void*)dictItems, LIST, 1)));
+    dict_cls->giveAttr("iteritems", new BoxedFunction(FunctionMetadata::create((void*)dictIterItems,
+                                                                               typeFromClass(dictiteritem_cls), 1)));
 
-    dict_cls->giveAttr("values", new BoxedFunction(boxRTFunction((void*)dictValues, LIST, 1)));
-    dict_cls->giveAttr("itervalues",
-                       new BoxedFunction(boxRTFunction((void*)dictIterValues, typeFromClass(dict_iterator_cls), 1)));
+    dict_cls->giveAttr("values", new BoxedFunction(FunctionMetadata::create((void*)dictValues, LIST, 1)));
+    dict_cls->giveAttr("itervalues", new BoxedFunction(FunctionMetadata::create((void*)dictIterValues,
+                                                                                typeFromClass(dictitervalue_cls), 1)));
 
-    dict_cls->giveAttr("keys", new BoxedFunction(boxRTFunction((void*)dictKeys, LIST, 1)));
+    dict_cls->giveAttr("keys", new BoxedFunction(FunctionMetadata::create((void*)dictKeys, LIST, 1)));
     dict_cls->giveAttr("iterkeys", dict_cls->getattr(internStringMortal("__iter__")));
 
-    dict_cls->giveAttr("pop", new BoxedFunction(boxRTFunction((void*)dictPop, UNKNOWN, 3, false, false), { NULL }));
-    dict_cls->giveAttr("popitem", new BoxedFunction(boxRTFunction((void*)dictPopitem, BOXED_TUPLE, 1)));
+    dict_cls->giveAttr("pop",
+                       new BoxedFunction(FunctionMetadata::create((void*)dictPop, UNKNOWN, 3, false, false), { NULL }));
+    dict_cls->giveAttr("popitem", new BoxedFunction(FunctionMetadata::create((void*)dictPopitem, BOXED_TUPLE, 1)));
 
-    auto* fromkeys_func = new BoxedFunction(boxRTFunction((void*)dictFromkeys, DICT, 3, false, false), { None });
+    auto* fromkeys_func
+        = new BoxedFunction(FunctionMetadata::create((void*)dictFromkeys, DICT, 3, false, false), { None });
     dict_cls->giveAttr("fromkeys", boxInstanceMethod(dict_cls, fromkeys_func, dict_cls));
 
-    dict_cls->giveAttr("viewkeys", new BoxedFunction(boxRTFunction((void*)dictViewKeys, UNKNOWN, 1)));
-    dict_cls->giveAttr("viewvalues", new BoxedFunction(boxRTFunction((void*)dictViewValues, UNKNOWN, 1)));
-    dict_cls->giveAttr("viewitems", new BoxedFunction(boxRTFunction((void*)dictViewItems, UNKNOWN, 1)));
+    dict_cls->giveAttr("viewkeys", new BoxedFunction(FunctionMetadata::create((void*)dictViewKeys, UNKNOWN, 1)));
+    dict_cls->giveAttr("viewvalues", new BoxedFunction(FunctionMetadata::create((void*)dictViewValues, UNKNOWN, 1)));
+    dict_cls->giveAttr("viewitems", new BoxedFunction(FunctionMetadata::create((void*)dictViewItems, UNKNOWN, 1)));
 
-    dict_cls->giveAttr("get", new BoxedFunction(boxRTFunction((void*)dictGet, UNKNOWN, 3, false, false), { None }));
+    dict_cls->giveAttr("get",
+                       new BoxedFunction(FunctionMetadata::create((void*)dictGet, UNKNOWN, 3, false, false), { None }));
 
-    dict_cls->giveAttr("setdefault",
-                       new BoxedFunction(boxRTFunction((void*)dictSetdefault, UNKNOWN, 3, false, false), { None }));
+    dict_cls->giveAttr(
+        "setdefault",
+        new BoxedFunction(FunctionMetadata::create((void*)dictSetdefault, UNKNOWN, 3, false, false), { None }));
 
-    auto dict_getitem = boxRTFunction((void*)dictGetitem<CXX>, UNKNOWN, 2, ParamNames::empty(), CXX);
-    addRTFunction(dict_getitem, (void*)dictGetitem<CAPI>, UNKNOWN, CAPI);
+    auto dict_getitem = FunctionMetadata::create((void*)dictGetitem<CXX>, UNKNOWN, 2, ParamNames::empty(), CXX);
+    dict_getitem->addVersion((void*)dictGetitem<CAPI>, UNKNOWN, CAPI);
     dict_cls->giveAttr("__getitem__", new BoxedFunction(dict_getitem));
-    dict_cls->giveAttr("__setitem__", new BoxedFunction(boxRTFunction((void*)dictSetitem, NONE, 3)));
-    dict_cls->giveAttr("__delitem__", new BoxedFunction(boxRTFunction((void*)dictDelitem, UNKNOWN, 2)));
-    dict_cls->giveAttr("__contains__", new BoxedFunction(boxRTFunction((void*)dictContains, BOXED_BOOL, 2)));
+    dict_cls->giveAttr("__setitem__", new BoxedFunction(FunctionMetadata::create((void*)dictSetitem, NONE, 3)));
+    dict_cls->giveAttr("__delitem__", new BoxedFunction(FunctionMetadata::create((void*)dictDelitem, UNKNOWN, 2)));
+    dict_cls->giveAttr("__contains__", new BoxedFunction(FunctionMetadata::create((void*)dictContains, BOXED_BOOL, 2)));
 
-    dict_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)dictNonzero, BOXED_BOOL, 1)));
+    dict_cls->giveAttr("__nonzero__", new BoxedFunction(FunctionMetadata::create((void*)dictNonzero, BOXED_BOOL, 1)));
 
     dict_cls->freeze();
 
-    CLFunction* hasnext = boxRTFunction((void*)dictIterHasnextUnboxed, BOOL, 1);
-    addRTFunction(hasnext, (void*)dictIterHasnext, BOXED_BOOL);
-    dict_iterator_cls->giveAttr("__hasnext__", new BoxedFunction(hasnext));
-    dict_iterator_cls->giveAttr(
-        "__iter__", new BoxedFunction(boxRTFunction((void*)dictIterIter, typeFromClass(dict_iterator_cls), 1)));
-    dict_iterator_cls->giveAttr("next", new BoxedFunction(boxRTFunction((void*)dictIterNext, UNKNOWN, 1)));
-    dict_iterator_cls->freeze();
-    dict_iterator_cls->tp_iter = PyObject_SelfIter;
-    dict_iterator_cls->tp_iternext = dictiter_next;
+    // create the dictonary iterator types
+    for (BoxedClass* iter_type : { dictiterkey_cls, dictitervalue_cls, dictiteritem_cls }) {
+        FunctionMetadata* hasnext = FunctionMetadata::create((void*)dictIterHasnextUnboxed, BOOL, 1);
+        hasnext->addVersion((void*)dictIterHasnext, BOXED_BOOL);
+        iter_type->giveAttr("__hasnext__", new BoxedFunction(hasnext));
+        iter_type->giveAttr(
+            "__iter__", new BoxedFunction(FunctionMetadata::create((void*)dictIterIter, typeFromClass(iter_type), 1)));
+        iter_type->giveAttr("next", new BoxedFunction(FunctionMetadata::create((void*)dictIterNext, UNKNOWN, 1)));
+        iter_type->freeze();
+        iter_type->tp_iter = PyObject_SelfIter;
+        iter_type->tp_iternext = dictiter_next;
+        iter_type->tp_flags &= ~Py_TPFLAGS_BASETYPE; // subclassing is not allowed
+    }
+
 
     // Manually set some tp_* slots *after* calling freeze() -> fixup_slot_dispatchers().
     // fixup_slot_dispatchers will insert a wrapper like slot_tp_init into tp_init, which calls the python-level
@@ -887,15 +894,9 @@ void setupDict() {
 
     dict_cls->tp_as_sequence->sq_contains = (objobjproc)PyDict_Contains;
 
-    dict_keys_cls->giveAttr(
-        "__iter__", new BoxedFunction(boxRTFunction((void*)dictViewKeysIter, typeFromClass(dict_iterator_cls), 1)));
-    dict_keys_cls->freeze();
-    dict_values_cls->giveAttr(
-        "__iter__", new BoxedFunction(boxRTFunction((void*)dictViewValuesIter, typeFromClass(dict_iterator_cls), 1)));
-    dict_values_cls->freeze();
-    dict_items_cls->giveAttr(
-        "__iter__", new BoxedFunction(boxRTFunction((void*)dictViewItemsIter, typeFromClass(dict_iterator_cls), 1)));
-    dict_items_cls->freeze();
+    PyType_Ready(&PyDictKeys_Type);
+    PyType_Ready(&PyDictValues_Type);
+    PyType_Ready(&PyDictItems_Type);
 }
 
 void teardownDict() {
